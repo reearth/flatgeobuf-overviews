@@ -3,7 +3,6 @@
 A scale-optimized, FlatGeobuf-compatible format.
 
 Status: Draft v0 / reference implementation in this repository
-Related project: untiled (on-demand vector tile engine)
 Binary specification: [SPEC.md](SPEC.md) · Compatibility verification: [COMPAT.md](COMPAT.md)
 
 ---
@@ -23,8 +22,8 @@ on-demand tile rendering fast at any zoom. It is the vector analogue of what
 Cloud-Optimized GeoTIFF did for rasters with overviews, and what COPC did for
 point clouds with its octree VLR.
 
-The core of the design is to serialize the output of untiled's `prepare`
-step (a deterministic pure function) — per-vertex importance, low-zoom
+The core of the design is to serialize the output of a deterministic
+`prepare` step (a pure function) — per-vertex importance, low-zoom
 overviews, and cell-clipped fragments of oversized features — into a
 cloud-optimized static file layout. FGBO fills the design space between
 fgb's "features stay features" flexibility and PMTiles' low-zoom performance.
@@ -147,9 +146,9 @@ index remains fully valid.
    (a direct consequence of `prepare` being a deterministic pure function).
    Compatible with CDN caching, diff distribution, and reproducibility
    verification.
-5. **Immutable** — write-once like fgb. Editing workflows belong to
-   untiled's DB-backed read-through mode; FGBO is the "distribute and host"
-   mode.
+5. **Immutable** — write-once like fgb. Editing workflows belong to a
+   DB-backed read-through serving mode (§7.2); FGBO is the "distribute and
+   host" mode.
 
 ---
 
@@ -297,8 +296,7 @@ Measured against the Rust reference implementation (6.0.1), flatgeobuf JS
 
 Following COPC's precedent of keeping `.laz`, FGBO **keeps the `.fgb`
 extension** and identifies via footer magic. The infix convention `*.o.fgb`
-may be used where distinguishing files matters; `ufgb` may be used as a CLI
-output specifier within the untiled ecosystem, but the file naming rule
+may be used where distinguishing files matters, but the file naming rule
 stays `*.fgb`.
 
 ---
@@ -319,17 +317,17 @@ stays `*.fgb`.
 
 ---
 
-## 7. Position in the untiled ecosystem
+## 7. Serving model and positioning
 
 ### 7.1 The file as "the image of prepare"
 
-In untiled's design, a tile is "source of truth + the image of a
+The underlying model: a tile is "source of truth + the image of a
 deterministic prepare function"; precomputation is a pure performance
 optimization (prefetch) decoupled from correctness. FGBO is exactly **that
 image serialized into a portable file**.
 
-- `untiled prepare` (offline CLI / warm job): GeoJSON / fgb → FGBO
-- untiled server / Workers: mount FGBO directly as a read-through backend
+- `fgbo build` (offline CLI / warm job): fgb → FGBO
+- tile server / Workers: mount FGBO directly as a read-through backend
 - Deterministic build: same input → byte-identical output, making
   distributed builds, verification, and caching trivial
 
@@ -338,7 +336,7 @@ image serialized into a portable file**.
 Put an FGBO file on R2 / S3 / static hosting and a tile URL stands up with
 Workers (or client wasm) + range requests. No database. Files are immutable,
 so cache invalidation does not exist as a problem. When editing is needed,
-move to untiled's DB-backed mode (PostGIS read-through):
+move to a DB-backed read-through mode (PostGIS etc.):
 
 | Mode | Source of truth | Edits | Serving cost |
 |---|---|---|---|
@@ -378,9 +376,9 @@ performance".
   Note: on already-generalized data (e.g. Natural Earth 110m) overviews
   barely shrink relative to the body — the gains materialize on
   high-resolution sources.
-- **Misreading immutability**: document clearly that "instant updates" are
-  untiled's DB mode and FGBO is for distribution/publishing/archives
-  requiring rebuilds.
+- **Misreading immutability**: document clearly that "instant updates"
+  belong to DB-backed serving and FGBO is for
+  distribution/publishing/archives requiring rebuilds.
 
 ---
 
@@ -415,4 +413,3 @@ performance".
 - P. van Oosterom & M. Meijers, "Vario-scale data structures supporting smooth zoom and progressive transfer of 2D and 3D data", IJGIS 28(3), 2014 — Space-Scale Cube
 - J.-H. Haunert, A. Dilo, P. van Oosterom, "Constrained set-up of the tGAP structure for progressive vector data transfer", Computers & Geosciences 35(11), 2009
 - I. Kamel & C. Faloutsos, "Hilbert R-tree: An improved R-tree using fractals", VLDB 1994 — the packed Hilbert R-tree underlying fgb's index
-- untiled design documents (origin of the prepare / importance / overview / segment definitions)
