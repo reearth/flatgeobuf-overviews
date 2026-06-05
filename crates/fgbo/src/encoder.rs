@@ -7,7 +7,7 @@ use crate::clip::{clip_geometry, Rect};
 use crate::error::{Error, Result};
 use crate::fgb::PropValue;
 use crate::format::{Directory, Footer, ImportanceEntry, OverviewEntry, SegmentsEntry, SENTINEL};
-use crate::importance::{geometry_importance, threshold_q, ImportanceSidecar};
+use crate::importance::{geometry_importance, threshold_q, SidecarStreamWriter};
 use crate::mercator::{project, sq_tolerance_for_zoom, unproject};
 use crate::simplify::{coord_count, filter_geometry, is_too_small};
 use flatgeobuf::{
@@ -142,13 +142,13 @@ fn to_lonlat(geom: &Geometry<f64>) -> Geometry<f64> {
     })
 }
 
-/// Write a mini-fgb out of collected features and return (size, count).
-fn write_mini_fgb<W: Write + Seek>(
-    out: &mut W,
-    schema: &Schema,
+/// Create a section writer (overview level / segments). `FgbWriter`
+/// spools added features to a temp file, so feeding it during the input
+/// pass keeps encoder memory independent of section content size.
+fn new_section_writer<'a>(
+    schema: &'a Schema,
     geometry_type: GeometryType,
-    features: &[FeatureRecord],
-) -> Result<(u64, u64)> {
+) -> Result<FgbWriter<'a>> {
     let options = FgbWriterOptions {
         write_index: true,
         detect_type: false,
@@ -166,22 +166,27 @@ fn write_mini_fgb<W: Write + Seek>(
     for (name, ty) in &schema.columns {
         writer.add_column(name, *ty, |_, _| {});
     }
-    for (geom, props) in features {
-        writer.add_feature_geom(geom.clone(), |feat| {
-            for (idx, val) in props {
-                let name = schema
-                    .columns
-                    .get(*idx as usize)
-                    .map(|(n, _)| n.as_str())
-                    .unwrap_or("");
-                let _ = feat.property(*idx as usize, name, &val.as_column_value());
-            }
-        })?;
-    }
-    let start = out.stream_position()?;
-    writer.write(&mut *out)?;
-    let end = out.stream_position()?;
-    Ok((end - start, features.len() as u64))
+    Ok(writer)
+}
+
+/// Add one feature (geometry + property row) to a section writer.
+fn add_section_feature(
+    writer: &mut FgbWriter<'_>,
+    schema: &Schema,
+    geom: Geometry<f64>,
+    props: &[(u16, PropValue)],
+) -> Result<()> {
+    writer.add_feature_geom(geom, |feat| {
+        for (idx, val) in props {
+            let name = schema
+                .columns
+                .get(*idx as usize)
+                .map(|(n, _)| n.as_str())
+                .unwrap_or("");
+            let _ = feat.property(*idx as usize, name, &val.as_column_value());
+        }
+    })?;
+    Ok(())
 }
 
 /// Encode `input` (a valid fgb with index and known feature count) into an
@@ -235,8 +240,11 @@ pub fn encode_file(input: &Path, output: &Path, opts: &EncodeOptions) -> Result<
     }
     let _ = schema.has_z;
 
-    // ---- pass over features -------------------------------------------
-    let mut sidecar = ImportanceSidecar::new();
+    // ---- pass over features, streaming into section writers ------------
+    // Memory stays bounded by per-feature transients + offset tables:
+    // overview/segments features spool into FgbWriter temp files, the
+    // sidecar payload into its own temp file.
+    let mut sidecar = SidecarStreamWriter::new()?;
     let level_qs: Vec<u16> = opts
         .levels
         .iter()
@@ -248,8 +256,16 @@ pub fn encode_file(input: &Path, output: &Path, opts: &EncodeOptions) -> Result<
         .map(|l| opts.drop_small_units / ((1u64 << l.max_zoom) as f64 * opts.extent as f64))
         .collect();
 
-    let mut level_features: Vec<Vec<FeatureRecord>> = vec![Vec::new(); opts.levels.len()];
-    let mut fragments: Vec<FeatureRecord> = Vec::new();
+    let mut level_writers: Vec<FgbWriter<'_>> = opts
+        .levels
+        .iter()
+        .map(|_| new_section_writer(&schema, schema.geometry_type))
+        .collect::<Result<_>>()?;
+    let mut level_counts: Vec<u64> = vec![0; opts.levels.len()];
+    // fragments may change geometry type (clipping) => Unknown; created
+    // lazily so files without large features never open the temp file
+    let mut segments_writer: Option<FgbWriter<'_>> = None;
+    let mut fragment_count: u64 = 0;
     let mut segmented_ordinals: Vec<u64> = Vec::new();
 
     let features_count: u64 = {
@@ -274,20 +290,31 @@ pub fn encode_file(input: &Path, output: &Path, opts: &EncodeOptions) -> Result<
             let merc = to_mercator(&geom);
             let imp = geometry_importance(&merc);
             debug_assert_eq!(imp.len(), coord_count(&geom));
-            sidecar.push(&imp);
+            sidecar.push(&imp)?;
 
             // overview levels
             for (li, q) in level_qs.iter().enumerate() {
                 if let Some(filtered) = filter_geometry(&geom, &imp, *q) {
                     if !is_too_small(&filtered, level_min_extents[li]) {
-                        level_features[li].push((filtered, props.clone()));
+                        add_section_feature(&mut level_writers[li], &schema, filtered, &props)?;
+                        level_counts[li] += 1;
                     }
                 }
             }
 
             // segments for large features
             if opts.v_max > 0 && coord_count(&geom) as u64 > opts.v_max as u64 {
+                // transient: only this one feature's fragments in memory
+                let mut fragments: Vec<FeatureRecord> = Vec::new();
                 segment_feature(&merc, &props, opts.zbase, &mut fragments);
+                if segments_writer.is_none() {
+                    segments_writer = Some(new_section_writer(&schema, GeometryType::Unknown)?);
+                }
+                let writer = segments_writer.as_mut().unwrap();
+                for (frag, frag_props) in fragments {
+                    add_section_feature(writer, &schema, to_lonlat(&frag), &frag_props)?;
+                    fragment_count += 1;
+                }
                 segmented_ordinals.push(ordinal);
             }
 
@@ -308,53 +335,52 @@ pub fn encode_file(input: &Path, output: &Path, opts: &EncodeOptions) -> Result<
     // sentinel
     out.write_all(&SENTINEL)?;
 
-    // importance sidecar
-    let imp_bytes = sidecar.encode();
+    // importance sidecar (payload streamed from its temp file)
     let imp_offset = out.stream_position()?;
-    out.write_all(&imp_bytes)?;
+    let imp_size = sidecar.write_to(&mut out)?;
     let importance = ImportanceEntry {
         offset: imp_offset,
-        size: imp_bytes.len() as u64,
+        size: imp_size,
         feature_count: features_count,
     };
 
     // overview sections
     let mut overview_entries = Vec::new();
     let mut overview_sizes = Vec::new();
-    for (li, level) in opts.levels.iter().enumerate() {
+    for ((level, writer), count) in opts
+        .levels
+        .iter()
+        .zip(level_writers)
+        .zip(level_counts.iter().copied())
+    {
         let offset = out.stream_position()?;
-        let (size, count) =
-            write_mini_fgb(&mut out, &schema, schema.geometry_type, &level_features[li])?;
+        writer.write(&mut out)?;
+        let size = out.stream_position()? - offset;
         overview_entries.push(OverviewEntry {
             offset,
             size,
             min_zoom: level.min_zoom,
             max_zoom: level.max_zoom,
-            tolerance_q: level_qs[li],
+            tolerance_q: level_qs[overview_entries.len()],
             feature_count: count,
         });
         overview_sizes.push((*level, size, count));
     }
 
-    // segments section (fragments may change geometry type => Unknown)
+    // segments section
     let mut segments = None;
     let mut segments_size = 0;
-    let fragment_count = fragments.len() as u64;
-    if !fragments.is_empty() {
+    if let Some(writer) = segments_writer {
         let offset = out.stream_position()?;
-        let lonlat_fragments: Vec<FeatureRecord> = fragments
-            .iter()
-            .map(|(g, p)| (to_lonlat(g), p.clone()))
-            .collect();
-        let (size, count) =
-            write_mini_fgb(&mut out, &schema, GeometryType::Unknown, &lonlat_fragments)?;
+        writer.write(&mut out)?;
+        let size = out.stream_position()? - offset;
         segments_size = size;
         segments = Some(SegmentsEntry {
             offset,
             size,
             zbase: opts.zbase,
             v_max: opts.v_max,
-            fragment_count: count,
+            fragment_count,
             segmented_ordinals: segmented_ordinals.clone(),
         });
     }

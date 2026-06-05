@@ -93,23 +93,23 @@ file into a servable artifact, on the same machine:
 | **`fgbo build`** | **1.7 s** (586k features/s) | 246 MiB (+17%) | features + fast tiles at every zoom |
 | `tippecanoe` → PMTiles (z0–14, `--drop-densest-as-needed`) | 69 s (~40× slower) | 86 MiB | baked tiles only |
 
-Build memory (peak RSS): the encoder streams the body (verbatim copy) and
-reads input features one at a time, so memory scales with the *extension
-sections being built* (importance sidecar + surviving overview features +
-fragments), not with file size:
+Build memory (peak RSS): the encoder is fully streaming — the body is a
+verbatim copy, input features are read one at a time, overview/segments
+features spool into `FgbWriter` temp files as they are produced, and the
+sidecar payload goes to its own temp file. What stays in memory is the
+sidecar offset table (8 B/feature), the section writers' node lists
+(~64 B per surviving feature), and one feature's transients:
 
 | input | peak RSS | ratio to input |
 |---|---|---|
 | 200k buildings (42 MiB) | 26 MiB | 0.6× |
-| 1M buildings (210 MiB) | 107 MiB | 0.5× |
-| 4M buildings (840 MiB) | 381 MiB | 0.45× |
-| NE 10m countries (8.5 MiB, vertex-dense) | 79 MiB | ~9× |
+| 1M buildings (210 MiB) | 36 MiB | 0.17× |
+| 4M buildings (840 MiB) | 93 MiB | 0.11× |
+| NE 10m countries (8.5 MiB, vertex-dense) | 36 MiB | ~4× |
 
-Building-like data is thinned hard, so memory stays well under the input
-size and scales linearly (~95 MiB per 1M buildings). Vertex-dense data
-where overviews retain most vertices (already-generalized world polygons)
-is the worst case: the in-memory overview copies dominate. Streaming the
-overview build is the known TODO for very large vertex-dense inputs.
+Vertex data never accumulates in memory, so even vertex-dense inputs are
+bounded by their largest single feature (transient geometry + its
+fragments during quadtree clipping), not by dataset size.
 
 Honest reading: PMTiles wins on serving latency (pre-baked) and output
 size (tiles compress and drop density), at the cost of losing the

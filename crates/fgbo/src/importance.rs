@@ -255,6 +255,54 @@ impl ImportanceSidecar {
     }
 }
 
+/// Streaming sidecar writer: the u16 payload goes to a temp file as
+/// features are processed; only the offset table (8 B per feature) stays
+/// in memory. Produces bytes identical to [`ImportanceSidecar::encode`].
+pub struct SidecarStreamWriter {
+    /// Byte offsets into payload; len == feature_count + 1.
+    offsets: Vec<u64>,
+    tmp: std::io::BufWriter<std::fs::File>,
+}
+
+impl SidecarStreamWriter {
+    pub fn new() -> std::io::Result<Self> {
+        Ok(SidecarStreamWriter {
+            offsets: vec![0],
+            tmp: std::io::BufWriter::new(tempfile::tempfile()?),
+        })
+    }
+
+    pub fn feature_count(&self) -> u64 {
+        (self.offsets.len() - 1) as u64
+    }
+
+    /// Append the importance array of the next feature (file order).
+    pub fn push(&mut self, imp: &[u16]) -> std::io::Result<()> {
+        use std::io::Write;
+        for v in imp {
+            self.tmp.write_all(&v.to_le_bytes())?;
+        }
+        self.offsets
+            .push(self.offsets.last().unwrap() + (imp.len() * 2) as u64);
+        Ok(())
+    }
+
+    /// Write the complete section (count + offset table + payload) and
+    /// return its size in bytes.
+    pub fn write_to<W: std::io::Write>(self, out: &mut W) -> std::io::Result<u64> {
+        use std::io::{Seek, SeekFrom};
+        out.write_all(&self.feature_count().to_le_bytes())?;
+        for o in &self.offsets {
+            out.write_all(&o.to_le_bytes())?;
+        }
+        let mut f = self.tmp.into_inner().map_err(|e| e.into_error())?;
+        f.seek(SeekFrom::Start(0))?;
+        let copied = std::io::copy(&mut f, out)?;
+        debug_assert_eq!(copied, *self.offsets.last().unwrap());
+        Ok(8 + self.offsets.len() as u64 * 8 + copied)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -346,6 +394,25 @@ mod tests {
         ];
         let imp = geometry_importance(&Geometry::Polygon(p));
         assert_eq!(imp.len(), 10); // 5 + 5 coords incl. closing dup
+    }
+
+    #[test]
+    fn stream_writer_matches_encode() {
+        let arrays: Vec<Vec<u16>> = vec![
+            vec![ALWAYS, 100, ALWAYS],
+            vec![ALWAYS],
+            vec![ALWAYS, 1, 2, 3, ALWAYS],
+        ];
+        let mut sc = ImportanceSidecar::new();
+        let mut sw = SidecarStreamWriter::new().unwrap();
+        for a in &arrays {
+            sc.push(a);
+            sw.push(a).unwrap();
+        }
+        let mut streamed = Vec::new();
+        let size = sw.write_to(&mut streamed).unwrap();
+        assert_eq!(streamed, sc.encode());
+        assert_eq!(size as usize, streamed.len());
     }
 
     #[test]

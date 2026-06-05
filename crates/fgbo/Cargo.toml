@@ -13,6 +13,7 @@ geo-types = { workspace = true }
 geo = { workspace = true }
 thiserror = { workspace = true }
 crc32fast = { workspace = true }
+tempfile = "3"
 
 [dev-dependencies]
 tempfile = "3"

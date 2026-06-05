@@ -130,6 +130,5 @@ let tile = render_tile(&mut reader, 2, 3, 1, &TileOptions::default())?;
   is straightforward)
 - No range-read coalescing yet — read `--stats` request counts as an upper
   bound for an HTTP deployment
-- The encoder holds overviews/segments in memory (streaming for huge
-  inputs is future work)
-- Benchmarks (PLATEAU / OSM extracts, per zoom band) are future work
+- Benchmarks on real data (PLATEAU / OSM extracts) are future work; see
+  [examples/README.md](examples/README.md) for synthetic-building numbers
