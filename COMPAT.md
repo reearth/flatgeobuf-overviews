@@ -89,7 +89,7 @@ extension"); documented as a spec caveat.
 
 ## Conclusion
 
-Profile A's compatibility design is empirically validated.
+FGBO's compatibility design is empirically validated.
 
 - Index-driven reads (fgb's core value): **compatible in every
   implementation tested**.

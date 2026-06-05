@@ -1,6 +1,6 @@
 # FlatGeobuf Overviews (FGBO) — Design Document
 
-A scale-optimized, FlatGeobuf-compatible format — Profile A.
+A scale-optimized, FlatGeobuf-compatible format.
 
 Status: Draft v0 / reference implementation in this repository
 Related project: untiled (on-demand vector tile engine)
@@ -18,7 +18,7 @@ vertex read must then be simplified per request.
 
 FGBO appends three kinds of sections after the fgb data section — an
 **importance sidecar**, **overview levels**, and **segments** — keeping full
-backward compatibility with existing fgb readers (Profile A) while making
+backward compatibility with existing fgb readers while making
 on-demand tile rendering fast at any zoom. It is the vector analogue of what
 Cloud-Optimized GeoTIFF did for rasters with overviews, and what COPC did for
 point clouds with its octree VLR.
@@ -311,7 +311,7 @@ stays `*.fgb`.
   terms, not the range-read part but the overview (mipmap) part. The name
   points there.
 - Propose as a low-profile extension to the fgb community (the path COPC
-  took in the LAZ community). Even if the proposal does not land, Profile A
+  took in the LAZ community). Even if the proposal does not land, FGBO
   works as an independent extension since files remain plain fgb.
 - The reference implementation is this repository (Rust). A wasm build for
   browser/Workers reading is the planned demonstration vehicle — a working
@@ -365,7 +365,7 @@ performance".
 ## 8. Risks and mitigations
 
 - **Yet another standard**: a new format proposal can end as "one more
-  standard". Mitigations: Profile A full compatibility (existing assets
+  standard". Mitigations: full plain-fgb compatibility (existing assets
   keep their value), extension proposal to the fgb community, reference
   implementation first, and following the proven COG/COPC path.
 - **Trailer-misreading readers**: confirmed real for the JS full-scan path

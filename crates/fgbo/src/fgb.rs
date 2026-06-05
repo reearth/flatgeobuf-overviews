@@ -1,7 +1,7 @@
 //! Low-level access to a FlatGeobuf "section": a complete fgb byte range
 //! (magic + header + optional index + data) embedded at an arbitrary offset
 //! of a larger file. Used both for the FGBO body and for overview/segments
-//! sections (Profile A reuses fgb encodings wholesale).
+//! sections (FGBO reuses fgb encodings wholesale).
 //!
 //! All reads are explicit seek+read so that I/O can be counted; the same
 //! access pattern maps 1:1 to HTTP range requests.

@@ -1,6 +1,6 @@
 //! # FGBO — FlatGeobuf Overviews
 //!
-//! Reference implementation of the FGBO format (Profile A): a
+//! Reference implementation of the FGBO format: a
 //! scale-optimized, fully FlatGeobuf-compatible extension that appends
 //! three kinds of sections after the fgb data section:
 //!
