@@ -339,12 +339,16 @@ impl<R: Read + Seek> FgboReader<R> {
                     }
                 }
             } else {
-                // plain fgb: live DP (baseline path)
+                // plain fgb: live DP (baseline path), in Q32 space like
+                // the precomputed sidecar
                 let merc = {
                     use geo::MapCoords;
                     geometry.map_coords(|c| {
-                        let (mx, my) = crate::mercator::project(c.x, c.y);
-                        geo_types::Coord { x: mx, y: my }
+                        let (qx, qy) = crate::mercator::lonlat_to_q32(c.x, c.y);
+                        geo_types::Coord {
+                            x: qx as f64,
+                            y: qy as f64,
+                        }
                     })
                 };
                 let imp = geometry_importance(&merc);

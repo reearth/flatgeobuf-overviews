@@ -1,61 +1,58 @@
 //! Per-vertex importance: a modified Douglas–Peucker pass that assigns each
-//! vertex the largest squared tolerance (unit mercator) at which it survives
-//! simplification, geojson-vt style, plus the u16 quantization and the
-//! sidecar section encoding.
+//! vertex the largest squared tolerance (Q32 unit mercator) at which it
+//! survives simplification, geojson-vt style, plus the u16 quantization
+//! and the sidecar section encoding.
 //!
-//! Importance values are quantized to u16 on a log scale (linear
-//! quantization lacks resolution near zero, where high-zoom tolerances
-//! live):
+//! Quantization and DP semantics are pinned exactly by fixtures — a
+//! bit-compatibility contract for sidecar interoperability:
 //!
-//! - `0`        : never survives (reserved, currently unused)
-//! - `1..=65534`: `q = 1 + round((log2(d2) + 64) / 64 * 65533)`, clamped
-//! - `65535`    : always survives (ring/part endpoints)
+//! - distances are squared Q32 distances, log-quantized:
+//!   `q = clamp(round(ln(1+d²) / ln(1+(2^32)²) × 65534), 1, 65534)`
+//! - `1`     : default for interior vertices never chosen by DP
+//!   (collinear/duplicate — droppable first)
+//! - `65535` : always survives (ring/part endpoints)
+//! - filtering keeps vertex `i` iff `imp[i] >= quantize(tol²(z))`
 
 use crate::error::{Error, Result};
+use crate::mercator::Q_SPAN;
 use geo_types::{Geometry, LineString};
 
 /// Importance value for vertices that always survive.
 pub const ALWAYS: u16 = u16::MAX;
 
-const LOG2_MIN: f64 = -64.0;
-const Q_RANGE: f64 = 65533.0;
-
-/// Quantize a squared distance (unit mercator) to u16, rounding *down*
-/// (a vertex never claims more importance than it has).
-pub fn quantize_sqdist(d2: f64) -> u16 {
-    if d2 <= 0.0 {
-        return 1;
-    }
-    let l = d2.log2();
-    if l <= LOG2_MIN {
-        return 1;
-    }
-    let q = ((l - LOG2_MIN) / -LOG2_MIN * Q_RANGE).floor() + 1.0;
-    q.clamp(1.0, 65534.0) as u16
+/// Largest possible squared distance in Q32 space: `(2^32)²`.
+#[inline]
+fn max_sqdist() -> f64 {
+    let s = Q_SPAN as f64;
+    s * s
 }
 
-/// Inverse of [`quantize_sqdist`] (lower bound of the bucket).
+/// Log-quantize a Q32 squared distance into `[1, 65534]` (monotonic).
+/// Log scale (not linear) is required for resolution at small distances.
+#[inline]
+pub fn quantize_sqdist(d2: f64) -> u16 {
+    let l = d2.max(0.0).ln_1p();
+    let max_l = max_sqdist().ln_1p();
+    let q = (l / max_l * (ALWAYS as f64 - 1.0)).round();
+    q.clamp(1.0, (ALWAYS - 1) as f64) as u16
+}
+
+/// Approximate inverse of [`quantize_sqdist`] (for tests/diagnostics).
 pub fn dequantize(q: u16) -> f64 {
-    if q == 0 {
-        return 0.0;
-    }
     if q == ALWAYS {
         return f64::INFINITY;
     }
-    let l = (q as f64 - 1.0) / Q_RANGE * -LOG2_MIN + LOG2_MIN;
-    l.exp2()
+    let max_l = max_sqdist().ln_1p();
+    (q as f64 / (ALWAYS as f64 - 1.0) * max_l).exp_m1()
 }
 
 /// Quantized threshold for filtering: keep vertex `i` iff
-/// `importance[i] >= threshold_q(sq_tolerance)`.
+/// `importance[i] >= threshold_q(sq_tolerance)` — the tolerance is
+/// quantized with the same function as the distances, so the comparison
+/// is consistent by construction.
+#[inline]
 pub fn threshold_q(sq_tolerance: f64) -> u16 {
-    // The smallest q whose dequantized value is >= sq_tolerance.
-    let q = quantize_sqdist(sq_tolerance);
-    if dequantize(q) >= sq_tolerance {
-        q
-    } else {
-        q.saturating_add(1).min(65534)
-    }
+    quantize_sqdist(sq_tolerance)
 }
 
 /// Squared distance from `p` to segment `a`-`b` (geojson-vt getSqSegDist).
@@ -80,50 +77,51 @@ fn sq_seg_dist(p: (f64, f64), a: (f64, f64), b: (f64, f64)) -> f64 {
     dx * dx + dy * dy
 }
 
-/// Douglas–Peucker pass assigning each interior vertex its survival
-/// squared distance, capped by the parent's value so that the per-vertex
-/// filter `imp >= tol` always yields a valid simplification. Iterative
-/// (explicit stack) to handle very large geometries.
-fn dp(coords: &[(f64, f64)], imp: &mut [f64], first: usize, last: usize, cap: f64) {
-    let mut stack = vec![(first, last, cap)];
-    while let Some((first, last, cap)) = stack.pop() {
+/// Douglas–Peucker pass assigning each chosen interior vertex its
+/// quantized max deviation (geojson-vt "z value" method). Pinned
+/// semantics: strict `>` tie-break, recursion stops when the max
+/// deviation is exactly 0, unchosen vertices keep the default `1`.
+/// Iterative (explicit stack) to handle very large geometries without
+/// blowing the call stack.
+fn dp(coords: &[(f64, f64)], imp: &mut [u16], first: usize, last: usize) {
+    let mut stack = vec![(first, last)];
+    while let Some((first, last)) = stack.pop() {
         if last <= first + 1 {
             continue;
         }
-        let mut max_d = -1.0;
-        let mut idx = first + 1;
+        let mut max_d = 0.0f64;
+        let mut idx = 0usize;
         for i in first + 1..last {
             let d = sq_seg_dist(coords[i], coords[first], coords[last]);
             if d > max_d {
-                max_d = d;
                 idx = i;
+                max_d = d;
             }
         }
-        let v = max_d.min(cap);
-        imp[idx] = v;
-        stack.push((first, idx, v));
-        stack.push((idx, last, v));
+        if max_d > 0.0 {
+            imp[idx] = quantize_sqdist(max_d);
+            stack.push((first, idx));
+            stack.push((idx, last));
+        }
     }
 }
 
-/// Compute importance for a single linestring/ring. Endpoints get [`ALWAYS`].
+/// Compute importance for a single linestring/ring. Endpoints get
+/// [`ALWAYS`], unchosen interior vertices stay at `1`.
 fn line_importance(line: &LineString<f64>, out: &mut Vec<u16>) {
     let coords: Vec<(f64, f64)> = line.coords().map(|c| (c.x, c.y)).collect();
     let n = coords.len();
     if n == 0 {
         return;
     }
-    if n <= 2 {
-        out.extend(std::iter::repeat_n(ALWAYS, n));
-        return;
+    let start = out.len();
+    out.extend(std::iter::repeat_n(1u16, n));
+    out[start] = ALWAYS;
+    out[start + n - 1] = ALWAYS;
+    if n > 2 {
+        let imp = &mut out[start..start + n];
+        dp(&coords, imp, 0, n - 1);
     }
-    let mut imp = vec![0.0f64; n];
-    dp(&coords, &mut imp, 0, n - 1, f64::INFINITY);
-    out.push(ALWAYS);
-    for &d2 in &imp[1..n - 1] {
-        out.push(quantize_sqdist(d2));
-    }
-    out.push(ALWAYS);
 }
 
 /// Compute the importance array for a geometry whose coordinates are in
@@ -306,12 +304,86 @@ impl SidecarStreamWriter {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use geo_types::{line_string, polygon};
+    use crate::mercator::lonlat_to_q32;
+    use geo_types::{line_string, polygon, Coord, LineString};
+
+    /// World span as f64 — test coordinates are in Q32 units.
+    const S: f64 = 4_294_967_296.0;
+
+    // Pinned quantization fixtures — the bit-compatibility contract.
+    // Changing these values breaks sidecar interoperability.
+    #[test]
+    fn quantize_fixtures() {
+        assert_eq!(quantize_sqdist(0.0), 1);
+        assert_eq!(quantize_sqdist(1.0), 1024);
+        assert_eq!(quantize_sqdist(2.0), 1623);
+        assert_eq!(quantize_sqdist(1e2), 6818);
+        assert_eq!(quantize_sqdist(1e6), 20409);
+        assert_eq!(quantize_sqdist(1e9), 30614);
+        assert_eq!(quantize_sqdist(1e12), 40819);
+        assert_eq!(quantize_sqdist(1e15), 51023);
+        assert_eq!(quantize_sqdist(1e18), 61228);
+        assert_eq!(quantize_sqdist(S * S), 65534);
+    }
+
+    #[test]
+    fn tolerance_threshold_fixtures() {
+        use crate::mercator::sq_tolerance_for_zoom;
+        assert_eq!(threshold_q(sq_tolerance_for_zoom(0, 4096)), 40959);
+        assert_eq!(threshold_q(sq_tolerance_for_zoom(4, 4096)), 32767);
+        assert_eq!(threshold_q(sq_tolerance_for_zoom(8, 4096)), 24575);
+        assert_eq!(threshold_q(sq_tolerance_for_zoom(11, 4096)), 18431);
+        assert_eq!(threshold_q(sq_tolerance_for_zoom(12, 4096)), 16384);
+        assert_eq!(threshold_q(sq_tolerance_for_zoom(14, 4096)), 12288);
+    }
+
+    /// Full-pipeline fixture: lon/lat -> Q32 -> importance arrays match
+    /// the companion prepare pipeline bit for bit.
+    #[test]
+    fn importance_fixtures() {
+        let to_q32_ls = |pts: &[(f64, f64)]| -> LineString<f64> {
+            LineString(
+                pts.iter()
+                    .map(|(lon, lat)| {
+                        let (x, y) = lonlat_to_q32(*lon, *lat);
+                        Coord {
+                            x: x as f64,
+                            y: y as f64,
+                        }
+                    })
+                    .collect(),
+            )
+        };
+
+        let pts: Vec<(f64, f64)> = (0..9)
+            .map(|i| {
+                let t = i as f64 / 8.0;
+                (130.0 + t, 33.0 + 0.5 * t + 0.05 * ((i % 3) as f64 - 1.0))
+            })
+            .collect();
+        let imp = geometry_importance(&Geometry::LineString(to_q32_ls(&pts)));
+        assert_eq!(
+            imp,
+            vec![65535, 19345, 41413, 39654, 19369, 41417, 40424, 19394, 65535]
+        );
+
+        let ring = [
+            (135.0, 35.0),
+            (135.5, 35.02),
+            (136.0, 35.0),
+            (136.0, 35.8),
+            (135.2, 35.6),
+            (135.0, 35.0),
+        ];
+        let p = geo_types::Polygon::new(to_q32_ls(&ring), vec![]);
+        let imp = geometry_importance(&Geometry::Polygon(p));
+        assert_eq!(imp, vec![65535, 37175, 47091, 49140, 45320, 65535]);
+    }
 
     #[test]
     fn quantize_monotone() {
         let mut prev = 0u16;
-        for e in (-70..0).map(|e| (e as f64).exp2()) {
+        for e in (0..64).map(|e| (e as f64).exp2()) {
             let q = quantize_sqdist(e);
             assert!(q >= prev, "quantization must be monotone");
             prev = q;
@@ -319,31 +391,17 @@ mod tests {
     }
 
     #[test]
-    fn quantize_dequantize_bounds() {
-        for &d2 in &[1e-18, 1e-12, 1e-6, 0.25, 0.999] {
+    fn quantize_dequantize_roundtrip() {
+        for &d2 in &[1.0, 1e3, 1e6, 1e12, 1e18] {
             let q = quantize_sqdist(d2);
-            // dequantize(q) <= d2 < dequantize(q+1)
-            assert!(dequantize(q) <= d2 * (1.0 + 1e-9), "d2={d2} q={q}");
-            assert!(dequantize(q + 1) > d2, "d2={d2} q={q}");
-        }
-    }
-
-    #[test]
-    fn threshold_filter_is_safe() {
-        // A vertex with importance exactly at tolerance must survive.
-        for &tol in &[1e-12f64, 1e-7, 1e-4] {
-            let t = threshold_q(tol);
-            let q = quantize_sqdist(tol);
-            assert!(dequantize(t) >= tol);
-            // anything with true d2 >= tol quantizes to >= q >= t - 1;
-            // conservative: filter never drops vertices well above tolerance
-            assert!(quantize_sqdist(tol * 4.0) >= t, "tol={tol} q={q} t={t}");
+            // inverse lands in the same bucket
+            assert_eq!(quantize_sqdist(dequantize(q)), q, "d2={d2} q={q}");
         }
     }
 
     #[test]
     fn line_endpoints_always() {
-        let ls = line_string![(x: 0.0, y: 0.0), (x: 0.5, y: 0.001), (x: 1.0, y: 0.0)];
+        let ls = line_string![(x: 0.0, y: 0.0), (x: 0.5 * S, y: 0.001 * S), (x: S, y: 0.0)];
         let imp = geometry_importance(&Geometry::LineString(ls));
         assert_eq!(imp.len(), 3);
         assert_eq!(imp[0], ALWAYS);
@@ -356,10 +414,10 @@ mod tests {
         // big deviation -> higher importance than small deviation
         let ls = line_string![
             (x: 0.0, y: 0.0),
-            (x: 0.25, y: 1e-6),
-            (x: 0.5, y: 0.1),
-            (x: 0.75, y: 1e-6),
-            (x: 1.0, y: 0.0)
+            (x: 0.25 * S, y: 10.0),
+            (x: 0.5 * S, y: 0.1 * S),
+            (x: 0.75 * S, y: 10.0),
+            (x: S, y: 0.0)
         ];
         let imp = geometry_importance(&Geometry::LineString(ls));
         assert!(imp[2] > imp[1]);
@@ -367,30 +425,20 @@ mod tests {
     }
 
     #[test]
-    fn monotone_nesting() {
-        // child importance never exceeds parent importance: filtering at any
-        // threshold yields endpoints + a consistent subset
+    fn collinear_vertices_stay_droppable() {
+        // exactly collinear interior vertices keep the default minimum
         let ls = line_string![
-            (x: 0.0, y: 0.0), (x: 0.1, y: 0.02), (x: 0.2, y: -0.01),
-            (x: 0.3, y: 0.07), (x: 0.4, y: 0.0), (x: 0.5, y: 0.3),
-            (x: 0.6, y: 0.01), (x: 0.7, y: -0.04), (x: 0.8, y: 0.02),
-            (x: 1.0, y: 0.0)
+            (x: 0.0, y: 0.0), (x: 0.25 * S, y: 0.0), (x: 0.5 * S, y: 0.0), (x: S, y: 0.0)
         ];
-        let imp = geometry_importance(&Geometry::LineString(ls.clone()));
-        // count survivors at decreasing tolerance: must be non-decreasing
-        let mut prev_survivors = 0;
-        for q in [60000u16, 50000, 40000, 30000, 1] {
-            let n = imp.iter().filter(|&&v| v >= q).count();
-            assert!(n >= prev_survivors);
-            prev_survivors = n;
-        }
+        let imp = geometry_importance(&Geometry::LineString(ls));
+        assert_eq!(imp, vec![ALWAYS, 1, 1, ALWAYS]);
     }
 
     #[test]
     fn polygon_ring_order() {
         let p = polygon![
-            exterior: [(x: 0.0, y: 0.0), (x: 1.0, y: 0.0), (x: 1.0, y: 1.0), (x: 0.0, y: 1.0), (x: 0.0, y: 0.0)],
-            interiors: [[(x: 0.4, y: 0.4), (x: 0.6, y: 0.4), (x: 0.6, y: 0.6), (x: 0.4, y: 0.6), (x: 0.4, y: 0.4)]]
+            exterior: [(x: 0.0, y: 0.0), (x: S, y: 0.0), (x: S, y: S), (x: 0.0, y: S), (x: 0.0, y: 0.0)],
+            interiors: [[(x: 0.4 * S, y: 0.4 * S), (x: 0.6 * S, y: 0.4 * S), (x: 0.6 * S, y: 0.6 * S), (x: 0.4 * S, y: 0.6 * S), (x: 0.4 * S, y: 0.4 * S)]]
         ];
         let imp = geometry_importance(&Geometry::Polygon(p));
         assert_eq!(imp.len(), 10); // 5 + 5 coords incl. closing dup

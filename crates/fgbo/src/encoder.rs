@@ -8,7 +8,7 @@ use crate::error::{Error, Result};
 use crate::fgb::PropValue;
 use crate::format::{Directory, Footer, ImportanceEntry, OverviewEntry, SegmentsEntry, SENTINEL};
 use crate::importance::{geometry_importance, threshold_q, SidecarStreamWriter};
-use crate::mercator::{project, sq_tolerance_for_zoom, unproject};
+use crate::mercator::{lonlat_to_q32, q32_to_lonlat, sq_tolerance_for_zoom, Q_SPAN};
 use crate::simplify::{coord_count, filter_geometry, is_too_small};
 use flatgeobuf::{
     ColumnType, FallibleStreamingIterator, FgbCrs, FgbReader, FgbWriter, FgbWriterOptions,
@@ -125,19 +125,24 @@ impl PropertyProcessor for PropCollector {
     }
 }
 
-/// Project a lon/lat geometry to unit mercator (y down), in place on a copy.
-fn to_mercator(geom: &Geometry<f64>) -> Geometry<f64> {
+/// Project a lon/lat geometry to Q32 unit mercator (y down), held as f64
+/// (u32 grid values are exact in f64, so all downstream distance math is
+/// deterministic).
+fn to_q32(geom: &Geometry<f64>) -> Geometry<f64> {
     use geo::MapCoords;
     geom.map_coords(|c| {
-        let (x, y) = project(c.x, c.y);
-        geo_types::Coord { x, y }
+        let (x, y) = lonlat_to_q32(c.x, c.y);
+        geo_types::Coord {
+            x: x as f64,
+            y: y as f64,
+        }
     })
 }
 
 fn to_lonlat(geom: &Geometry<f64>) -> Geometry<f64> {
     use geo::MapCoords;
     geom.map_coords(|c| {
-        let (lon, lat) = unproject(c.x, c.y);
+        let (lon, lat) = q32_to_lonlat(c.x, c.y);
         geo_types::Coord { x: lon, y: lat }
     })
 }
@@ -250,10 +255,15 @@ pub fn encode_file(input: &Path, output: &Path, opts: &EncodeOptions) -> Result<
         .iter()
         .map(|l| threshold_q(sq_tolerance_for_zoom(l.max_zoom, opts.extent)))
         .collect();
+    // Thinning threshold in Q32 units: drop_small_units extent-units at
+    // the level's max zoom, where one extent-unit = (2^32 >> z) / extent.
     let level_min_extents: Vec<f64> = opts
         .levels
         .iter()
-        .map(|l| opts.drop_small_units / ((1u64 << l.max_zoom) as f64 * opts.extent as f64))
+        .map(|l| {
+            opts.drop_small_units * ((Q_SPAN >> (l.max_zoom as u32).min(32)) as f64)
+                / opts.extent as f64
+        })
         .collect();
 
     let mut level_writers: Vec<FgbWriter<'_>> = opts
@@ -286,8 +296,8 @@ pub fn encode_file(input: &Path, output: &Path, opts: &EncodeOptions) -> Result<
             feature.process_properties(&mut props)?;
             let props = props.0;
 
-            // importance in unit mercator
-            let merc = to_mercator(&geom);
+            // importance in Q32 unit mercator
+            let merc = to_q32(&geom);
             let imp = geometry_importance(&merc);
             debug_assert_eq!(imp.len(), coord_count(&geom));
             sidecar.push(&imp)?;
@@ -423,7 +433,7 @@ pub fn encode_file(input: &Path, output: &Path, opts: &EncodeOptions) -> Result<
 /// thousands of fragments rather than one per zbase cell (millions).
 const FRAGMENT_STOP_VERTS: usize = 64;
 
-/// Clip a (mercator) geometry into grid cells and push fragments.
+/// Clip a (Q32-space) geometry into grid cells and push fragments.
 ///
 /// Recursive quadtree descent: each level clips against four child cells
 /// and only recurses where geometry remains. Descent stops at `zbase`
@@ -446,12 +456,12 @@ fn segment_feature(
         props: &[(u16, PropValue)],
         out: &mut Vec<FeatureRecord>,
     ) {
-        let n = (1u64 << z) as f64;
+        let span = (Q_SPAN >> (z as u32).min(32)) as f64;
         let rect = Rect::new(
-            cx as f64 / n,
-            cy as f64 / n,
-            (cx + 1) as f64 / n,
-            (cy + 1) as f64 / n,
+            cx as f64 * span,
+            cy as f64 * span,
+            (cx + 1) as f64 * span,
+            (cy + 1) as f64 * span,
         );
         let Some(clipped) = clip_geometry(geom, rect) else {
             return;

@@ -5,7 +5,7 @@
 //! [`crate::importance::geometry_importance`] produced it (which matches
 //! FlatGeobuf/geozero traversal).
 
-use crate::mercator::project;
+use crate::mercator::lonlat_to_q32;
 use geo_types::{Geometry, LineString, MultiLineString, MultiPolygon, Polygon};
 
 /// Streaming cursor over an importance array.
@@ -100,11 +100,13 @@ fn filter_polygon(p: &Polygon<f64>, cur: &mut ImpCursor<'_>, q: u16) -> Option<P
     ext.map(|e| Polygon::new(e, interiors))
 }
 
-/// Bounding box of a geometry in unit mercator: (min_x, min_y, max_x, max_y).
+/// Bounding box of a (lon/lat) geometry in Q32 unit mercator:
+/// (min_x, min_y, max_x, max_y).
 pub fn mercator_bbox(geom: &Geometry<f64>) -> Option<(f64, f64, f64, f64)> {
     let mut bbox: Option<(f64, f64, f64, f64)> = None;
     visit_coords(geom, &mut |x, y| {
-        let (mx, my) = project(x, y);
+        let (qx, qy) = lonlat_to_q32(x, y);
+        let (mx, my) = (qx as f64, qy as f64);
         bbox = Some(match bbox {
             None => (mx, my, mx, my),
             Some((a, b, c, d)) => (a.min(mx), b.min(my), c.max(mx), d.max(my)),
@@ -113,8 +115,9 @@ pub fn mercator_bbox(geom: &Geometry<f64>) -> Option<(f64, f64, f64, f64)> {
     bbox
 }
 
-/// Drop test for feature-level thinning: true when the geometry's mercator
-/// bbox is smaller than `min_extent` in both dimensions (lines/polygons only).
+/// Drop test for feature-level thinning: true when the geometry's Q32
+/// bbox is smaller than `min_extent` (Q32 units) in both dimensions
+/// (lines/polygons only).
 pub fn is_too_small(geom: &Geometry<f64>, min_extent: f64) -> bool {
     match geom {
         Geometry::Point(_) | Geometry::MultiPoint(_) => false,
@@ -170,11 +173,14 @@ mod tests {
     use crate::importance::{geometry_importance, ALWAYS};
     use geo_types::{line_string, polygon};
 
+    /// World span as f64 — test coordinates are in Q32 units.
+    const S: f64 = 4_294_967_296.0;
+
     #[test]
     fn filter_keeps_endpoints() {
         let ls = line_string![
-            (x: 0.0, y: 0.0), (x: 0.25, y: 1e-9), (x: 0.5, y: 0.1),
-            (x: 0.75, y: 1e-9), (x: 1.0, y: 0.0)
+            (x: 0.0, y: 0.0), (x: 0.25 * S, y: 4.0), (x: 0.5 * S, y: 0.1 * S),
+            (x: 0.75 * S, y: 4.0), (x: S, y: 0.0)
         ];
         let g = Geometry::LineString(ls);
         let imp = geometry_importance(&g);
@@ -185,8 +191,8 @@ mod tests {
             _ => panic!(),
         }
         // moderate threshold keeps the big spike but drops the small
-        // deviations (whose post-spike DP distance is ~0.0025)
-        let q = crate::importance::threshold_q(0.005);
+        // deviations (whose post-spike DP distance is ~(0.05·S)²)
+        let q = crate::importance::threshold_q(0.005 * S * S);
         let f = filter_geometry(&g, &imp, q).unwrap();
         match f {
             Geometry::LineString(l) => assert_eq!(l.0.len(), 3),
@@ -197,15 +203,15 @@ mod tests {
     #[test]
     fn filter_consistency_with_count() {
         let p = polygon![
-            (x: 0.0, y: 0.0), (x: 0.5, y: 0.001), (x: 1.0, y: 0.0),
-            (x: 1.0, y: 1.0), (x: 0.0, y: 1.0), (x: 0.0, y: 0.0)
+            (x: 0.0, y: 0.0), (x: 0.5 * S, y: 0.001 * S), (x: S, y: 0.0),
+            (x: S, y: S), (x: 0.0, y: S), (x: 0.0, y: 0.0)
         ];
         let g = Geometry::Polygon(p);
         let imp = geometry_importance(&g);
         assert_eq!(imp.len(), coord_count(&g));
         // moderate threshold: square corners survive, near-collinear
-        // vertex (deviation 0.001 -> d2 ~ 1e-6) drops
-        let q = crate::importance::threshold_q(0.01);
+        // vertex (deviation 0.001·S) drops
+        let q = crate::importance::threshold_q(0.01 * S * S);
         let f = filter_geometry(&g, &imp, q).unwrap();
         match f {
             Geometry::Polygon(p) => assert_eq!(p.exterior().0.len(), 5),
@@ -217,10 +223,11 @@ mod tests {
 
     #[test]
     fn small_feature_detection() {
+        // lon/lat input; thresholds in Q32 units
         let tiny = Geometry::Polygon(polygon![
             (x: 139.0, y: 35.0), (x: 139.0001, y: 35.0), (x: 139.0001, y: 35.0001), (x: 139.0, y: 35.0)
         ]);
-        assert!(is_too_small(&tiny, 0.001));
-        assert!(!is_too_small(&tiny, 1e-9));
+        assert!(is_too_small(&tiny, 0.001 * S));
+        assert!(!is_too_small(&tiny, 1.0));
     }
 }

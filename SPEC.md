@@ -79,15 +79,25 @@ u16 × total_vertices  payload
 
 - Vertex order is fgb coordinate storage order (parts in order, exterior
   ring then interior rings, including the closing duplicate vertex).
-- Value: the largest squared tolerance (unit Web Mercator space, computed in
-  f64) at which the vertex survives simplification, log-quantized:
-  - `q = clamp(1 + floor((log2(d²) + 64) / 64 × 65533), 1, 65534)`
-  - `0` = reserved, `65535` = always kept (ring/part endpoints)
+- Coordinate space: **Q32 fixed-point unit Web Mercator** — lon/lat
+  projected to `[0, 2^32)²` (y down) via
+  `x = (lon+180)/360`, `y = (1 − asinh(tan φ)/π)/2`, each mapped with
+  `floor(v × 2^32)` clamped to u32. Snapping to the 32-bit grid before any
+  distance math makes builds deterministic across platforms.
+- Value: each vertex's squared deviation from a modified Douglas–Peucker
+  pass (geojson-vt "z value" method; strict `>` tie-break, descent stops
+  at zero deviation), log-quantized:
+  - `q = clamp(round(ln(1 + d²) / ln(1 + (2^32)²) × 65534), 1, 65534)`
+  - `1` = default for vertices never chosen by DP (collinear/duplicate —
+    droppable first), `65535` = always kept (ring/part endpoints)
 - Usage: a tile at zoom z keeps vertex i iff
-  `importance[i] ≥ threshold_q(tol²(z))` — an O(n) filter, where
-  `tol(z) = 1 / (2^z × extent)` (default extent 4096).
-- Quantization is monotone, so simplification results nest between any two
-  zoom levels.
+  `importance[i] ≥ quantize(tol²(z))` — an O(n) filter, where
+  `tol(z) = (2^32 >> z) / extent` in Q32 units (default extent 4096).
+  The tolerance is quantized with the same function as the distances, so
+  the comparison is consistent by construction.
+- The exact projection, quantization, and DP semantics are pinned by
+  fixture tests; they are the bit-compatibility contract for any other
+  producer/consumer of importance values.
 
 ## 5. Overview sections
 
