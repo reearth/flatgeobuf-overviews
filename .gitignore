@@ -1,0 +1,4 @@
+/target
+node_modules/
+testdata/*.o.fgb
+*.mvt

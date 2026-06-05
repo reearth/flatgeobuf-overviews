@@ -1,0 +1,22 @@
+[package]
+name = "fgbo-cli"
+description = "CLI and tile server for FlatGeobuf Overviews (FGBO)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "fgbo"
+path = "src/main.rs"
+
+[dependencies]
+fgbo = { path = "../fgbo" }
+flatgeobuf = { workspace = true }
+geozero = { workspace = true }
+clap = { workspace = true }
+tokio = { workspace = true }
+axum = { workspace = true }
+anyhow = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }

@@ -1,0 +1,18 @@
+[package]
+name = "fgbo"
+description = "FlatGeobuf Overviews (FGBO) — scale-optimized FlatGeobuf-compatible format: encoder, decoder, and tiling"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+flatgeobuf = { workspace = true }
+geozero = { workspace = true }
+geo-types = { workspace = true }
+geo = { workspace = true }
+thiserror = { workspace = true }
+crc32fast = { workspace = true }
+
+[dev-dependencies]
+tempfile = "3"
