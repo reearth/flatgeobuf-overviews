@@ -11,7 +11,7 @@ use crate::fgb::{
     decode_properties, feature_root, feature_to_geo, read_range, FgbSection, IoStats, PropValue,
 };
 use crate::format::{Directory, Footer, FOOTER_SIZE};
-use crate::importance::{geometry_importance, threshold_q, ImportanceSidecar};
+use crate::importance::{geometry_importance, threshold_q};
 use crate::mercator::{sq_tolerance_for_zoom, TileBounds};
 use crate::simplify::filter_geometry;
 use flatgeobuf::GeometryType;
@@ -57,9 +57,17 @@ pub struct FgboReader<R> {
     /// Lazily opened overview sections (parallel to directory.overviews).
     overview_sections: Vec<Option<FgbSection>>,
     segments_section: Option<FgbSection>,
-    /// Lazily loaded importance sidecar (v0 loads the whole section once;
-    /// a remote reader would range-read per ordinal instead).
-    sidecar: Option<ImportanceSidecar>,
+    /// Lazily loaded importance offset table (count+1 u64 entries, small).
+    /// Per-feature importance arrays are range-read on demand so a tile
+    /// query never loads the whole sidecar.
+    sidecar_table: Option<SidecarTable>,
+}
+
+struct SidecarTable {
+    /// Absolute offset of the payload (u16 arrays).
+    payload_offset: u64,
+    /// Byte offsets into the payload, count+1 entries.
+    offsets: Vec<u64>,
 }
 
 impl FgboReader<BufReader<File>> {
@@ -107,7 +115,7 @@ impl<R: Read + Seek> FgboReader<R> {
             body,
             overview_sections: (0..n_overviews).map(|_| None).collect(),
             segments_section: None,
-            sidecar: None,
+            sidecar_table: None,
         })
     }
 
@@ -146,28 +154,64 @@ impl<R: Read + Seek> FgboReader<R> {
         Ok(())
     }
 
-    fn ensure_sidecar(&mut self) -> Result<()> {
-        if self.sidecar.is_none() {
+    /// Load the importance offset table (small: count+1 u64s). The payload
+    /// is range-read per feature in [`Self::importance_for`].
+    fn ensure_sidecar_table(&mut self) -> Result<()> {
+        if self.sidecar_table.is_none() {
             if let Some(e) = self.directory.as_ref().and_then(|d| d.importance.clone()) {
-                let buf = read_range(&mut self.r, &self.stats, e.offset, e.size as usize)?;
-                self.sidecar = Some(ImportanceSidecar::decode(&buf)?);
+                let head = read_range(&mut self.r, &self.stats, e.offset, 8)?;
+                let count = u64::from_le_bytes(head[0..8].try_into().unwrap()) as usize;
+                let table_bytes =
+                    read_range(&mut self.r, &self.stats, e.offset + 8, (count + 1) * 8)?;
+                let offsets: Vec<u64> = table_bytes
+                    .chunks_exact(8)
+                    .map(|c| u64::from_le_bytes(c.try_into().unwrap()))
+                    .collect();
+                self.sidecar_table = Some(SidecarTable {
+                    payload_offset: e.offset + 8 + (count as u64 + 1) * 8,
+                    offsets,
+                });
             }
         }
         Ok(())
     }
 
-    /// Read all features of `section` intersecting the lon/lat bbox.
+    /// Range-read the importance array of one feature ordinal.
+    fn importance_for(&mut self, ordinal: u64) -> Result<Option<Vec<u16>>> {
+        let Some(table) = &self.sidecar_table else {
+            return Ok(None);
+        };
+        let i = ordinal as usize;
+        if i + 1 >= table.offsets.len() {
+            return Ok(None);
+        }
+        let (start, end) = (table.offsets[i], table.offsets[i + 1]);
+        let abs = table.payload_offset + start;
+        let buf = read_range(&mut self.r, &self.stats, abs, (end - start) as usize)?;
+        Ok(Some(
+            buf.chunks_exact(2)
+                .map(|c| u16::from_le_bytes(c.try_into().unwrap()))
+                .collect(),
+        ))
+    }
+
+    /// Read all features of `section` intersecting the lon/lat bbox,
+    /// skipping ordinals in `exclude` (sorted) *before* reading any bytes.
     /// Returns (ordinal, TileFeature) pairs in offset order.
     fn query_section(
         section: &FgbSection,
         r: &mut R,
         stats: &IoStats,
         bbox: (f64, f64, f64, f64),
+        exclude: &[u64],
     ) -> Result<Vec<(u64, TileFeature)>> {
         if section.features_count == 0 {
             return Ok(Vec::new());
         }
-        let items = section.search(r, stats, bbox.0, bbox.1, bbox.2, bbox.3)?;
+        let mut items = section.search(r, stats, bbox.0, bbox.1, bbox.2, bbox.3)?;
+        if !exclude.is_empty() {
+            items.retain(|i| exclude.binary_search(&(i.index as u64)).is_err());
+        }
         let header = section.header();
         let geometry_type = header.geometry_type();
         let columns = crate::fgb::column_names(&header);
@@ -223,7 +267,7 @@ impl<R: Read + Seek> FgboReader<R> {
         if let Some(pos) = overview_pos {
             self.ensure_overview(pos)?;
             let section = self.overview_sections[pos].take().unwrap();
-            let result = Self::query_section(&section, &mut self.r, &self.stats, bbox);
+            let result = Self::query_section(&section, &mut self.r, &self.stats, bbox, &[]);
             self.overview_sections[pos] = Some(section);
             let features = result?.into_iter().map(|(_, f)| f).collect();
             return Ok(TileQuery {
@@ -242,7 +286,20 @@ impl<R: Read + Seek> FgboReader<R> {
             .map(|s| z >= s.zbase)
             .unwrap_or(false);
 
-        let body_features = Self::query_section(&self.body, &mut self.r, &self.stats, bbox)?;
+        // segmented features are served by fragments at z >= zbase; exclude
+        // them from the body query *before* reading their (large) records
+        let segmented: Vec<u64> = if use_segments {
+            self.directory
+                .as_ref()
+                .and_then(|d| d.segments.as_ref())
+                .map(|s| s.segmented_ordinals.clone())
+                .unwrap_or_default()
+        } else {
+            Vec::new()
+        };
+
+        let body_features =
+            Self::query_section(&self.body, &mut self.r, &self.stats, bbox, &segmented)?;
 
         let has_sidecar = self
             .directory
@@ -250,18 +307,8 @@ impl<R: Read + Seek> FgboReader<R> {
             .map(|d| d.importance.is_some())
             .unwrap_or(false);
         if has_sidecar {
-            self.ensure_sidecar()?;
+            self.ensure_sidecar_table()?;
         }
-
-        let segmented: &[u64] = if use_segments {
-            self.directory
-                .as_ref()
-                .and_then(|d| d.segments.as_ref())
-                .map(|s| s.segmented_ordinals.as_slice())
-                .unwrap_or(&[])
-        } else {
-            &[]
-        };
 
         let mut features = Vec::with_capacity(body_features.len());
         let source = if has_sidecar {
@@ -271,12 +318,9 @@ impl<R: Read + Seek> FgboReader<R> {
         };
 
         for (ordinal, tf) in body_features {
-            if use_segments && segmented.binary_search(&ordinal).is_ok() {
-                continue; // served by fragments below
-            }
-            let filtered = if let Some(sidecar) = &self.sidecar {
-                match sidecar.get(ordinal) {
-                    Some(imp) => filter_geometry(&tf.geometry, imp, q),
+            let filtered = if has_sidecar {
+                match self.importance_for(ordinal)? {
+                    Some(imp) => filter_geometry(&tf.geometry, &imp, q),
                     None => Some(tf.geometry.clone()),
                 }
             } else {
@@ -304,7 +348,7 @@ impl<R: Read + Seek> FgboReader<R> {
         if use_segments {
             self.ensure_segments()?;
             if let Some(seg) = self.segments_section.take() {
-                let result = Self::query_section(&seg, &mut self.r, &self.stats, bbox);
+                let result = Self::query_section(&seg, &mut self.r, &self.stats, bbox, &[]);
                 self.segments_section = Some(seg);
                 let frags = result?;
                 fragment_features = frags.len();
@@ -330,10 +374,10 @@ impl<R: Read + Seek> FgboReader<R> {
         buffer_frac: f64,
     ) -> Result<TileQuery> {
         let saved = self.directory.take();
-        let saved_sidecar = self.sidecar.take();
+        let saved_table = self.sidecar_table.take();
         let result = self.query_tile(z, x, y, extent, buffer_frac);
         self.directory = saved;
-        self.sidecar = saved_sidecar;
+        self.sidecar_table = saved_table;
         result
     }
 

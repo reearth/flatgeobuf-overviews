@@ -112,12 +112,16 @@ full-resolution Data section is never touched.
 
 ## 6. Segments section
 
-Fragments of features whose vertex count exceeds `v_max`, pre-clipped at
-the zbase (default z12) grid cell boundaries. Stored as a **complete
-mini-FlatGeobuf** with geometry type `Unknown` (clipping can change
-geometry types) and its own Hilbert R-tree; fragments retain the original
-feature's attributes. The directory's `segmented_ordinals` identifies the
-affected body features.
+Fragments of features whose vertex count exceeds `v_max`, pre-clipped by a
+quadtree descent over power-of-two grid cells: each fragment is emitted
+either at a zbase (default z12) cell, or earlier at a coarser cell as soon
+as it is small (≤ 64 coords) — so polygon interiors collapse to a few
+full-cell rectangles instead of one fragment per zbase cell (COPC-octree
+style; a continent-sized polygon yields thousands of fragments, not
+millions). Stored as a **complete mini-FlatGeobuf** with geometry type
+`Unknown` (clipping can change geometry types) and its own Hilbert R-tree;
+fragments retain the original feature's attributes. The directory's
+`segmented_ordinals` identifies the affected body features.
 
 Reading at z ≥ zbase:
 1. Exclude features listed in `segmented_ordinals` from body bbox results.
@@ -127,10 +131,11 @@ Spatial lookup deliberately reuses the fgb R-tree (bbox query) instead of a
 dedicated Morton-cell table: equivalent I/O behavior with no new encoding,
 per the "reuse fgb encodings" principle.
 
-Tile boundaries at z ≥ zbase are subdivisions of zbase cell boundaries
-(nested power-of-two grids), so artificial cut edges are absorbed by
-tile-edge clipping. Below zbase, segments are not used (overviews cover
-those zooms). Per-fragment importance is omitted in v0 (at z ≥ zbase the
+All fragment cells are power-of-two grid cells at z ≤ zbase, and tile
+boundaries at z ≥ zbase are subdivisions of those cell boundaries (nested
+power-of-two grids), so artificial cut edges are absorbed by tile-edge
+clipping. Below zbase, segments are not used (overviews cover those
+zooms). Per-fragment importance is omitted in v0 (at z ≥ zbase the
 required simplification is small).
 
 ## 7. Read protocol (tile z/x/y)

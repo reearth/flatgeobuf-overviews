@@ -1,0 +1,219 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>fgb vs FGBO — overview rendering comparison</title>
+<link rel="stylesheet" href="https://unpkg.com/maplibre-gl@4/dist/maplibre-gl.css">
+<script src="https://unpkg.com/maplibre-gl@4/dist/maplibre-gl.js"></script>
+<style>
+  :root {
+    --bg: #0e1116;
+    --panel: rgba(14, 17, 22, 0.88);
+    --fg: #e6e9ef;
+    --dim: #8b94a3;
+    --baseline: #ff8e3c;
+    --fgbo: #41c7a6;
+  }
+  html, body { margin: 0; height: 100%; background: var(--bg);
+    font: 13px/1.5 ui-sans-serif, system-ui, sans-serif; color: var(--fg); }
+  #wrap { display: flex; height: 100%; }
+  .pane { position: relative; flex: 1; min-width: 0; }
+  .pane + .pane { border-left: 2px solid #2a3140; }
+  .map { position: absolute; inset: 0; }
+
+  .hud {
+    position: absolute; left: 10px; top: 10px; z-index: 5;
+    background: var(--panel); border: 1px solid #2a3140; border-radius: 8px;
+    padding: 10px 12px; min-width: 230px; backdrop-filter: blur(4px);
+  }
+  .hud h2 { margin: 0 0 6px; font-size: 13px; letter-spacing: .02em; }
+  .hud h2 .dot { display: inline-block; width: 9px; height: 9px;
+    border-radius: 50%; margin-right: 6px; }
+  #hud-baseline h2 .dot { background: var(--baseline); }
+  #hud-fgbo h2 .dot { background: var(--fgbo); }
+  .hud .sub { color: var(--dim); font-size: 11px; margin-bottom: 8px; }
+  .stats { display: grid; grid-template-columns: auto 1fr; gap: 1px 10px; }
+  .stats dt { color: var(--dim); }
+  .stats dd { margin: 0; text-align: right; font-variant-numeric: tabular-nums; }
+  .stats dd.big { font-size: 16px; font-weight: 600; }
+  .src { margin-top: 6px; font-size: 11px; color: var(--dim); }
+  .src b { color: var(--fg); font-weight: 600; }
+
+  #topbar {
+    position: absolute; z-index: 6; top: 10px; left: 50%;
+    transform: translateX(-50%);
+    background: var(--panel); border: 1px solid #2a3140; border-radius: 8px;
+    padding: 6px 12px; display: flex; gap: 12px; align-items: center;
+    white-space: nowrap;
+  }
+  #topbar button {
+    background: #232a36; color: var(--fg); border: 1px solid #39424f;
+    border-radius: 6px; padding: 3px 10px; cursor: pointer; font: inherit;
+  }
+  #topbar button:hover { background: #2c3543; }
+  #zoom { color: var(--dim); font-variant-numeric: tabular-nums; }
+</style>
+</head>
+<body>
+<div id="wrap">
+  <div class="pane">
+    <div id="map-baseline" class="map"></div>
+    <div class="hud" id="hud-baseline">
+      <h2><span class="dot"></span>plain fgb (baseline)</h2>
+      <div class="sub">body bbox query + per-request Douglas–Peucker</div>
+      <dl class="stats">
+        <dt>tiles</dt><dd id="b-tiles">0</dd>
+        <dt>last tile</dt><dd class="big" id="b-last">–</dd>
+        <dt>avg tile</dt><dd id="b-avg">–</dd>
+        <dt>bytes read</dt><dd class="big" id="b-bytes">0 B</dd>
+        <dt>range reads</dt><dd id="b-reqs">0</dd>
+      </dl>
+      <div class="src">source: <b id="b-src">–</b></div>
+    </div>
+  </div>
+  <div class="pane">
+    <div id="map-fgbo" class="map"></div>
+    <div class="hud" id="hud-fgbo">
+      <h2><span class="dot"></span>FGBO</h2>
+      <div class="sub">overviews / importance filter / segments</div>
+      <dl class="stats">
+        <dt>tiles</dt><dd id="f-tiles">0</dd>
+        <dt>last tile</dt><dd class="big" id="f-last">–</dd>
+        <dt>avg tile</dt><dd id="f-avg">–</dd>
+        <dt>bytes read</dt><dd class="big" id="f-bytes">0 B</dd>
+        <dt>range reads</dt><dd id="f-reqs">0</dd>
+      </dl>
+      <div class="src">source: <b id="f-src">–</b></div>
+    </div>
+  </div>
+</div>
+<div id="topbar">
+  <span><b>__LAYER__</b> — same file, two read paths</span>
+  <span id="zoom">z –</span>
+  <button id="reset">reset counters</button>
+</div>
+
+<script>
+const LAYER = '__LAYER__';
+
+// ---- per-mode stats, fed by a custom tile protocol --------------------
+const stats = {
+  baseline: { tiles: 0, ms: 0, lastMs: 0, bytes: 0, reqs: 0, src: '–' },
+  fgbo:     { tiles: 0, ms: 0, lastMs: 0, bytes: 0, reqs: 0, src: '–' },
+};
+
+function human(n) {
+  if (n >= 1 << 20) return (n / (1 << 20)).toFixed(1) + ' MiB';
+  if (n >= 1 << 10) return (n / (1 << 10)).toFixed(1) + ' KiB';
+  return n + ' B';
+}
+
+function renderHud() {
+  for (const [mode, p] of [['baseline', 'b'], ['fgbo', 'f']]) {
+    const s = stats[mode];
+    document.getElementById(p + '-tiles').textContent = s.tiles;
+    document.getElementById(p + '-last').textContent =
+      s.tiles ? s.lastMs.toFixed(1) + ' ms' : '–';
+    document.getElementById(p + '-avg').textContent =
+      s.tiles ? (s.ms / s.tiles).toFixed(1) + ' ms' : '–';
+    document.getElementById(p + '-bytes').textContent = human(s.bytes);
+    document.getElementById(p + '-reqs').textContent = s.reqs;
+    document.getElementById(p + '-src').textContent = s.src;
+  }
+}
+
+// custom protocol so we can read the stats headers of every tile response
+maplibregl.addProtocol('cmp', async (params, abortController) => {
+  // cmp://<mode>/<z>/<x>/<y>
+  const path = params.url.replace('cmp://', '');
+  const mode = path.split('/')[0];
+  const res = await fetch(location.origin + '/tiles/' + path + '.mvt', {
+    signal: abortController.signal,
+  });
+  if (!res.ok) throw new Error('tile failed: ' + res.status);
+  const s = stats[mode];
+  s.tiles += 1;
+  s.lastMs = parseFloat(res.headers.get('x-gen-ms') || '0');
+  s.ms += s.lastMs;
+  s.bytes += parseInt(res.headers.get('x-read-bytes') || '0', 10);
+  s.reqs += parseInt(res.headers.get('x-read-requests') || '0', 10);
+  s.src = res.headers.get('x-tile-source') || '–';
+  renderHud();
+  return { data: await res.arrayBuffer() };
+});
+
+// ---- two synced maps ---------------------------------------------------
+function makeMap(container, mode, accent) {
+  return new maplibregl.Map({
+    container,
+    attributionControl: false,
+    style: {
+      version: 8,
+      sources: {
+        src: {
+          type: 'vector',
+          tiles: ['cmp://' + mode + '/{z}/{x}/{y}'],
+          minzoom: 0,
+          maxzoom: 22,
+        },
+      },
+      layers: [
+        { id: 'bg', type: 'background', paint: { 'background-color': '#10141a' } },
+        { id: 'fill', type: 'fill', source: 'src', 'source-layer': LAYER,
+          filter: ['==', ['geometry-type'], 'Polygon'],
+          paint: { 'fill-color': accent, 'fill-opacity': 0.18 } },
+        { id: 'line', type: 'line', source: 'src', 'source-layer': LAYER,
+          paint: { 'line-color': accent, 'line-width': 1.1 } },
+        { id: 'pts', type: 'circle', source: 'src', 'source-layer': LAYER,
+          filter: ['==', ['geometry-type'], 'Point'],
+          paint: { 'circle-color': accent, 'circle-radius': 3 } },
+      ],
+    },
+    center: [15, 30],
+    zoom: 1.5,
+  });
+}
+
+const mapB = makeMap('map-baseline', 'baseline', '#ff8e3c');
+const mapF = makeMap('map-fgbo', 'fgbo', '#41c7a6');
+mapF.addControl(new maplibregl.NavigationControl());
+
+// two-way camera sync with a re-entrancy guard
+let syncing = false;
+function sync(from, to) {
+  from.on('move', () => {
+    if (syncing) return;
+    syncing = true;
+    to.jumpTo({
+      center: from.getCenter(),
+      zoom: from.getZoom(),
+      bearing: from.getBearing(),
+      pitch: from.getPitch(),
+    });
+    syncing = false;
+    document.getElementById('zoom').textContent =
+      'z ' + from.getZoom().toFixed(2);
+  });
+}
+sync(mapB, mapF);
+sync(mapF, mapB);
+
+// ---- reset: clear counters and force re-fetch ---------------------------
+document.getElementById('reset').addEventListener('click', () => {
+  for (const mode of ['baseline', 'fgbo']) {
+    Object.assign(stats[mode], { tiles: 0, ms: 0, lastMs: 0, bytes: 0, reqs: 0, src: '–' });
+  }
+  renderHud();
+  for (const m of [mapB, mapF]) {
+    const src = m.getSource('src');
+    if (src && src.setTiles) {
+      // re-set the tile URL to drop MapLibre's tile cache
+      src.setTiles(src.tiles.slice());
+    }
+  }
+});
+
+renderHud();
+</script>
+</body>
+</html>

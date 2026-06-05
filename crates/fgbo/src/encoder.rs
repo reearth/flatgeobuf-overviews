@@ -390,36 +390,55 @@ pub fn encode_file(input: &Path, output: &Path, opts: &EncodeOptions) -> Result<
     })
 }
 
-/// Clip a (mercator) geometry into zbase grid cells and push fragments.
+/// A fragment this small stops the quadtree descent early: descending
+/// further would multiply fragment count without reducing read size.
+/// Polygon interiors collapse to full-cell rectangles (5 coords) and stop
+/// immediately, COPC-octree style, so a continent-sized polygon produces
+/// thousands of fragments rather than one per zbase cell (millions).
+const FRAGMENT_STOP_VERTS: usize = 64;
+
+/// Clip a (mercator) geometry into grid cells and push fragments.
+///
+/// Recursive quadtree descent: each level clips against four child cells
+/// and only recurses where geometry remains. Descent stops at `zbase`
+/// (boundary detail) or as soon as a fragment is small
+/// ([`FRAGMENT_STOP_VERTS`]). All emitted cells are power-of-two grid
+/// cells at z ≤ zbase, so tile boundaries at z ≥ zbase still nest within
+/// fragment edges.
 fn segment_feature(
     merc: &Geometry<f64>,
     props: &[(u16, PropValue)],
     zbase: u8,
     out: &mut Vec<FeatureRecord>,
 ) {
-    let Some((min_x, min_y, max_x, max_y)) = crate::simplify::mercator_bbox(&to_lonlat(merc))
-    else {
-        return;
-    };
-    let n = (1u64 << zbase) as f64;
-    let cx0 = (min_x * n).floor().max(0.0) as u64;
-    let cy0 = (min_y * n).floor().max(0.0) as u64;
-    let cx1 = ((max_x * n).ceil() as u64).min(1u64 << zbase);
-    let cy1 = ((max_y * n).ceil() as u64).min(1u64 << zbase);
-
-    for cy in cy0..cy1.max(cy0 + 1) {
-        for cx in cx0..cx1.max(cx0 + 1) {
-            let rect = Rect::new(
-                cx as f64 / n,
-                cy as f64 / n,
-                (cx + 1) as f64 / n,
-                (cy + 1) as f64 / n,
-            );
-            if let Some(frag) = clip_geometry(merc, rect) {
-                out.push((frag, props.to_vec()));
-            }
+    fn recurse(
+        geom: &Geometry<f64>,
+        z: u8,
+        cx: u64,
+        cy: u64,
+        zbase: u8,
+        props: &[(u16, PropValue)],
+        out: &mut Vec<FeatureRecord>,
+    ) {
+        let n = (1u64 << z) as f64;
+        let rect = Rect::new(
+            cx as f64 / n,
+            cy as f64 / n,
+            (cx + 1) as f64 / n,
+            (cy + 1) as f64 / n,
+        );
+        let Some(clipped) = clip_geometry(geom, rect) else {
+            return;
+        };
+        if z == zbase || coord_count(&clipped) <= FRAGMENT_STOP_VERTS {
+            out.push((clipped, props.to_vec()));
+            return;
+        }
+        for (dx, dy) in [(0, 0), (1, 0), (0, 1), (1, 1)] {
+            recurse(&clipped, z + 1, cx * 2 + dx, cy * 2 + dy, zbase, props, out);
         }
     }
+    recurse(merc, 0, 0, 0, zbase, props, out);
 }
 
 fn validate_levels(levels: &[LevelSpec]) -> Result<()> {

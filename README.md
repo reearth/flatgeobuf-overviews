@@ -47,8 +47,23 @@ cargo run -rp fgbo-cli -- info output.fgb
 cargo run -rp fgbo-cli -- tile output.fgb 2 3 1 --stats -o tile.mvt
 
 # Tile server + MapLibre debug page (http://127.0.0.1:8080/)
+# /compare shows fgb vs FGBO side by side with live I/O + timing stats
 cargo run -rp fgbo-cli -- serve output.fgb
 ```
+
+### Side-by-side comparison demo
+
+```sh
+./examples/compare/run.sh   # downloads NE 10m countries, builds, serves
+# open http://127.0.0.1:8080/compare
+```
+
+Two synced MapLibre maps render the same file through the plain-fgb
+baseline path (left) and the FGBO path (right), with per-tile generation
+time, bytes read, and range-read counts. With NE 10m countries: ~2× less
+I/O and ~3× faster tiles at low zoom (overviews), ~5× less I/O and ~6×
+faster over large coastline features at z13 (segments). See
+[examples/README.md](examples/README.md).
 
 As a library:
 

@@ -1,14 +1,29 @@
-//! HTTP tile server: /tiles/{z}/{x}/{y}.mvt + MapLibre debug page.
+//! HTTP tile server: /tiles/{mode}/{z}/{x}/{y}.mvt + MapLibre debug pages.
+//!
+//! Two read modes serve the same file so they can be compared directly:
+//! - `fgbo`     — the FGBO read protocol (overviews / importance / segments)
+//! - `baseline` — plain-fgb behavior (body bbox query + on-the-fly DP)
+//!
+//! Per-tile statistics are exposed as response headers
+//! (X-Tile-Source / X-Read-Bytes / X-Read-Requests / X-Gen-Ms) for the
+//! /compare page.
 
 use anyhow::Result;
 use axum::extract::{Path as AxPath, State};
-use axum::http::{header, StatusCode};
+use axum::http::{header, HeaderName, StatusCode};
 use axum::response::{Html, IntoResponse, Response};
 use axum::routing::get;
 use axum::Router;
 use fgbo::{render_tile, FgboReader, TileOptions};
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::Instant;
+
+/// MapLibre comparison page (template; `__LAYER__` is substituted).
+const COMPARE_HTML: &str = include_str!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/../../examples/compare/index.html"
+));
 
 struct AppState {
     file: PathBuf,
@@ -28,7 +43,7 @@ async fn run_async(file: PathBuf, addr: &str) -> Result<()> {
         (reader.layer_name(), reader.is_fgbo())
     };
     tracing::info!(
-        "serving {} (layer {layer:?}, FGBO: {is_fgbo}) on http://{addr}/",
+        "serving {} (layer {layer:?}, FGBO: {is_fgbo}) on http://{addr}/ (comparison: http://{addr}/compare)",
         file.display()
     );
 
@@ -40,7 +55,8 @@ async fn run_async(file: PathBuf, addr: &str) -> Result<()> {
 
     let app = Router::new()
         .route("/", get(index))
-        .route("/tiles/{z}/{x}/{y}", get(tile))
+        .route("/compare", get(compare))
+        .route("/tiles/{mode}/{z}/{x}/{y}", get(tile))
         .with_state(state);
 
     let listener = tokio::net::TcpListener::bind(addr).await?;
@@ -49,10 +65,15 @@ async fn run_async(file: PathBuf, addr: &str) -> Result<()> {
 }
 
 async fn tile(
-    AxPath((z, x, y)): AxPath<(u8, u32, String)>,
+    AxPath((mode, z, x, y)): AxPath<(String, u8, u32, String)>,
     State(state): State<Arc<AppState>>,
 ) -> Response {
-    // allow /tiles/z/x/y, /tiles/z/x/y.mvt, /tiles/z/x/y.pbf
+    let baseline = match mode.as_str() {
+        "fgbo" => false,
+        "baseline" => true,
+        _ => return (StatusCode::NOT_FOUND, "mode must be fgbo or baseline").into_response(),
+    };
+    // allow y, y.mvt, y.pbf
     let y = y
         .trim_end_matches(".mvt")
         .trim_end_matches(".pbf")
@@ -67,27 +88,52 @@ async fn tile(
     let file = state.file.clone();
     let result = tokio::task::spawn_blocking(move || {
         let mut reader = FgboReader::open_file(&file)?;
-        render_tile(&mut reader, z, x, y, &TileOptions::default())
+        let opts = TileOptions {
+            baseline,
+            ..Default::default()
+        };
+        let start = Instant::now();
+        let tile = render_tile(&mut reader, z, x, y, &opts)?;
+        let gen_ms = start.elapsed().as_secs_f64() * 1000.0;
+        fgbo::Result::Ok((tile, gen_ms, reader.stats.bytes(), reader.stats.requests()))
     })
     .await;
 
     match result {
-        Ok(Ok(tile)) => (
+        Ok(Ok((tile, gen_ms, bytes, requests))) => (
             StatusCode::OK,
             [
-                (header::CONTENT_TYPE, "application/x-protobuf"),
-                (header::ACCESS_CONTROL_ALLOW_ORIGIN, "*"),
-                (header::CACHE_CONTROL, "public, max-age=86400, immutable"),
+                (header::CONTENT_TYPE, "application/x-protobuf".to_string()),
+                (header::ACCESS_CONTROL_ALLOW_ORIGIN, "*".to_string()),
+                (header::CACHE_CONTROL, "no-store".to_string()),
+                (
+                    HeaderName::from_static("x-tile-source"),
+                    format!("{:?}", tile.source),
+                ),
+                (HeaderName::from_static("x-read-bytes"), bytes.to_string()),
+                (
+                    HeaderName::from_static("x-read-requests"),
+                    requests.to_string(),
+                ),
+                (HeaderName::from_static("x-gen-ms"), format!("{gen_ms:.1}")),
+                (
+                    HeaderName::from_static("x-feature-count"),
+                    tile.feature_count.to_string(),
+                ),
             ],
             tile.data,
         )
             .into_response(),
         Ok(Err(e)) => {
-            tracing::error!("tile {z}/{x}/{y}: {e}");
+            tracing::error!("tile {mode}/{z}/{x}/{y}: {e}");
             (StatusCode::INTERNAL_SERVER_ERROR, format!("{e}")).into_response()
         }
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, format!("{e}")).into_response(),
     }
+}
+
+async fn compare(State(state): State<Arc<AppState>>) -> Html<String> {
+    Html(COMPARE_HTML.replace("__LAYER__", &state.layer))
 }
 
 async fn index(State(state): State<Arc<AppState>>) -> Html<String> {
@@ -106,10 +152,11 @@ async fn index(State(state): State<Arc<AppState>>) -> Html<String> {
   #badge {{ position: absolute; top: 8px; left: 8px; z-index: 1;
     background: #222; color: #fff; padding: 4px 10px; border-radius: 4px;
     font: 12px/1.4 sans-serif; }}
+  #badge a {{ color: #8cf; }}
 </style>
 </head>
 <body>
-<div id="badge">{layer} ({badge})</div>
+<div id="badge">{layer} ({badge}) — <a href="/compare">side-by-side comparison</a></div>
 <div id="map"></div>
 <script>
 const map = new maplibregl.Map({{
@@ -119,7 +166,7 @@ const map = new maplibregl.Map({{
     sources: {{
       fgbo: {{
         type: 'vector',
-        tiles: [location.origin + '/tiles/{{z}}/{{x}}/{{y}}.mvt'],
+        tiles: [location.origin + '/tiles/fgbo/{{z}}/{{x}}/{{y}}.mvt'],
         minzoom: 0,
         maxzoom: 22
       }}
