@@ -8,14 +8,14 @@
 //! (X-Tile-Source / X-Read-Bytes / X-Read-Requests / X-Gen-Ms) for the
 //! /compare page.
 
+use crate::util;
 use anyhow::Result;
 use axum::extract::{Path as AxPath, State};
 use axum::http::{header, HeaderName, StatusCode};
 use axum::response::{Html, IntoResponse, Response};
 use axum::routing::get;
 use axum::Router;
-use fgbo::{render_tile, FgboReader, TileOptions};
-use std::path::PathBuf;
+use fgbo::{render_tile, TileOptions};
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -26,25 +26,24 @@ const COMPARE_HTML: &str = include_str!(concat!(
 ));
 
 struct AppState {
-    file: PathBuf,
+    file: String,
     layer: String,
     is_fgbo: bool,
 }
 
-pub fn run(file: PathBuf, addr: &str) -> Result<()> {
+pub fn run(file: String, addr: &str) -> Result<()> {
     let rt = tokio::runtime::Runtime::new()?;
     rt.block_on(run_async(file, addr))
 }
 
-async fn run_async(file: PathBuf, addr: &str) -> Result<()> {
+async fn run_async(file: String, addr: &str) -> Result<()> {
     // open once for metadata + early validation
     let (layer, is_fgbo) = {
-        let reader = FgboReader::open_file(&file)?;
+        let reader = util::open_reader(&file)?;
         (reader.layer_name(), reader.is_fgbo())
     };
     tracing::info!(
-        "serving {} (layer {layer:?}, FGBO: {is_fgbo}) on http://{addr}/ (comparison: http://{addr}/compare)",
-        file.display()
+        "serving {file} (layer {layer:?}, FGBO: {is_fgbo}) on http://{addr}/ (comparison: http://{addr}/compare)"
     );
 
     let state = Arc::new(AppState {
@@ -87,7 +86,8 @@ async fn tile(
 
     let file = state.file.clone();
     let result = tokio::task::spawn_blocking(move || {
-        let mut reader = FgboReader::open_file(&file)?;
+        let mut reader =
+            util::open_reader(&file).map_err(|e| fgbo::Error::InvalidInput(e.to_string()))?;
         let opts = TileOptions {
             baseline,
             ..Default::default()

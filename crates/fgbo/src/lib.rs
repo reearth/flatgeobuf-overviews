@@ -21,6 +21,8 @@ pub mod encoder;
 pub mod error;
 pub mod fgb;
 pub mod format;
+#[cfg(feature = "http")]
+pub mod http;
 pub mod importance;
 pub mod mercator;
 pub mod simplify;
@@ -30,4 +32,6 @@ pub use decoder::{FgboReader, TileFeature, TileQuery, TileSource};
 pub use encoder::{encode_file, EncodeOptions, EncodeReport, LevelSpec};
 pub use error::{Error, Result};
 pub use format::{Directory, Footer};
+#[cfg(feature = "http")]
+pub use http::HttpRangeReader;
 pub use tile::{render_tile, RenderedTile, TileOptions};

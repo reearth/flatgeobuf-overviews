@@ -3,10 +3,11 @@
 mod bench;
 mod serve;
 mod synth;
+mod util;
 
 use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand};
-use fgbo::{encode_file, render_tile, EncodeOptions, FgboReader, LevelSpec, TileOptions};
+use fgbo::{encode_file, render_tile, EncodeOptions, LevelSpec, TileOptions};
 use std::io::Write;
 use std::path::PathBuf;
 
@@ -43,10 +44,11 @@ enum Command {
         drop_small: f64,
     },
     /// Show fgb header and FGBO directory information
-    Info { file: PathBuf },
-    /// Render one MVT tile
+    /// (accepts a local path or an http(s) URL)
+    Info { file: String },
+    /// Render one MVT tile (accepts a local path or an http(s) URL)
     Tile {
-        file: PathBuf,
+        file: String,
         z: u8,
         x: u32,
         y: u32,
@@ -62,7 +64,8 @@ enum Command {
     },
     /// Serve tiles over HTTP with a MapLibre debug page
     Serve {
-        file: PathBuf,
+        /// FGBO file: local path or http(s) URL
+        file: String,
         /// Listen address
         #[arg(long, default_value = "127.0.0.1:8080")]
         addr: String,
@@ -97,8 +100,8 @@ enum Command {
     },
     /// Benchmark baseline (plain fgb) vs FGBO tile reads on the same file
     Bench {
-        /// An FGBO file (output of `fgbo build`)
-        file: PathBuf,
+        /// An FGBO file (output of `fgbo build`); local path or URL
+        file: String,
         /// Zoom levels to sample
         #[arg(long, default_value = "8,10,12,14")]
         zooms: String,
@@ -196,10 +199,10 @@ fn main() -> Result<()> {
         }
 
         Command::Info { file } => {
-            let reader = FgboReader::open_file(&file)?;
+            let reader = util::open_reader(&file)?;
             let body = reader.body();
             let header = body.header();
-            println!("file            : {}", file.display());
+            println!("file            : {file}");
             println!("size            : {}", human(reader.file_len()));
             println!("layer           : {}", header.name().unwrap_or(""));
             println!("geometry type   : {:?}", header.geometry_type());
@@ -262,7 +265,7 @@ fn main() -> Result<()> {
             baseline,
             stats,
         } => {
-            let mut reader = FgboReader::open_file(&file)?;
+            let mut reader = util::open_reader(&file)?;
             reader.stats.reset();
             let opts = TileOptions {
                 baseline,

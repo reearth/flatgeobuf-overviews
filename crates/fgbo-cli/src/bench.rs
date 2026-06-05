@@ -2,10 +2,10 @@
 //! per zoom band, over randomly sampled non-empty tiles.
 
 use crate::synth::Rng;
+use crate::util;
 use anyhow::{bail, Result};
-use fgbo::{render_tile, FgboReader, TileOptions, TileSource};
+use fgbo::{render_tile, TileOptions, TileSource};
 use std::collections::BTreeMap;
-use std::path::Path;
 use std::time::Instant;
 
 pub struct BenchOptions {
@@ -54,13 +54,10 @@ fn tile_at(z: u8, lon: f64, lat: f64) -> (u32, u32) {
     ((mx * n).min(n - 1.0) as u32, (my * n).min(n - 1.0) as u32)
 }
 
-pub fn bench(file: &Path, opts: &BenchOptions) -> Result<()> {
-    let mut reader = FgboReader::open_file(file)?;
+pub fn bench(file: &str, opts: &BenchOptions) -> Result<()> {
+    let mut reader = util::open_reader(file)?;
     if !reader.is_fgbo() {
-        bail!(
-            "{} is not an FGBO file (run `fgbo build` first)",
-            file.display()
-        );
+        bail!("{file} is not an FGBO file (run `fgbo build` first)");
     }
 
     // data envelope for tile sampling
@@ -75,7 +72,7 @@ pub fn bench(file: &Path, opts: &BenchOptions) -> Result<()> {
 
     println!(
         "# fgbo bench — {} ({}, {} features)\n",
-        file.display(),
+        file,
         fmt_bytes(reader.file_len()),
         reader.body().features_count,
     );

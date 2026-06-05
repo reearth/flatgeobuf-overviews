@@ -11,7 +11,7 @@ name = "fgbo"
 path = "src/main.rs"
 
 [dependencies]
-fgbo = { path = "../fgbo" }
+fgbo = { path = "../fgbo", features = ["http"] }
 flatgeobuf = { workspace = true }
 geozero = { workspace = true }
 clap = { workspace = true }
