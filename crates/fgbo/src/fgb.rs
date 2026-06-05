@@ -190,6 +190,9 @@ impl FgbSection {
     /// Spatial bbox search over the section index. Results are sorted by
     /// data-relative byte offset; `index` is the feature ordinal in file
     /// order.
+    ///
+    /// Small indexes are fetched in a single range read; large ones are
+    /// traversed with per-node reads (`PackedRTree::stream_search`).
     pub fn search<R: Read + Seek>(
         &self,
         r: &mut R,
@@ -202,16 +205,33 @@ impl FgbSection {
         if !self.has_index() {
             return Err(Error::Format("section has no spatial index".into()));
         }
-        let mut win = WindowReader::new(r, stats, self.index_offset, self.index_size);
-        let mut items = PackedRTree::stream_search(
-            &mut win,
-            self.features_count as usize,
-            self.node_size,
-            min_x,
-            min_y,
-            max_x,
-            max_y,
-        )?;
+        let mut items = if self.index_size <= SMALL_INDEX_BYTES {
+            let buf = read_range(r, stats, self.index_offset, self.index_size as usize)?;
+            PackedRTree::stream_search(
+                &mut std::io::Cursor::new(buf),
+                self.features_count as usize,
+                self.node_size,
+                min_x,
+                min_y,
+                max_x,
+                max_y,
+            )?
+        } else {
+            // stream_search reads node items field by field (8 B at a
+            // time); buffer one node group per underlying range read
+            let win = WindowReader::new(r, stats, self.index_offset, self.index_size);
+            let group_bytes = (self.node_size as usize).max(2) * 40;
+            let mut buffered = std::io::BufReader::with_capacity(group_bytes, win);
+            PackedRTree::stream_search(
+                &mut buffered,
+                self.features_count as usize,
+                self.node_size,
+                min_x,
+                min_y,
+                max_x,
+                max_y,
+            )?
+        };
         items.sort_by_key(|i| i.offset);
         Ok(items)
     }
@@ -227,7 +247,7 @@ impl FgbSection {
         let abs = self.data_offset + offset;
         let len_buf = read_range(r, stats, abs, 4)?;
         let len = u32::from_le_bytes(len_buf[0..4].try_into().unwrap()) as usize;
-        if len > 512 * 1024 * 1024 {
+        if len > MAX_FEATURE_BYTES {
             return Err(Error::Format(format!("feature too large: {len}")));
         }
         let mut buf = Vec::with_capacity(len + 4);
@@ -238,7 +258,89 @@ impl FgbSection {
             .map_err(|e| Error::Format(format!("invalid feature record: {e}")))?;
         Ok(buf)
     }
+
+    /// Read many feature records with range coalescing: consecutive hits
+    /// whose gap is at most [`COALESCE_GAP_BYTES`] share one range read
+    /// (over-reading the skipped bytes), the way an HTTP reader would
+    /// batch requests. Returns `(ordinal, size-prefixed buffer)` pairs in
+    /// offset order.
+    pub fn read_features<R: Read + Seek>(
+        &self,
+        r: &mut R,
+        stats: &IoStats,
+        items: &[SearchResultItem],
+    ) -> Result<Vec<(u64, Vec<u8>)>> {
+        let section_end = if self.size > 0 {
+            self.offset + self.size
+        } else {
+            u64::MAX
+        };
+        let mut out = Vec::with_capacity(items.len());
+
+        let mut group_start = 0usize;
+        while group_start < items.len() {
+            // grow the group while gaps stay small
+            let mut group_end = group_start + 1;
+            while group_end < items.len()
+                && (items[group_end].offset - items[group_end - 1].offset) as u64
+                    <= COALESCE_GAP_BYTES
+            {
+                group_end += 1;
+            }
+            let group = &items[group_start..group_end];
+            group_start = group_end;
+
+            let first = self.data_offset + group[0].offset as u64;
+            let last_rel = group.last().unwrap().offset as u64;
+            let last_abs = self.data_offset + last_rel;
+            // read through the last feature's length prefix, padding small
+            // groups up to a minimum request size (one round trip beats a
+            // tiny read + follow-up for the body)
+            let read_end = (last_abs + 4)
+                .max(first + MIN_GROUP_READ_BYTES)
+                .min(section_end.max(last_abs + 4));
+            let mut buf = read_range(r, stats, first, (read_end - first) as usize)?;
+
+            // the last feature may extend beyond what we have
+            let last_in_buf = (last_abs - first) as usize;
+            let last_len =
+                u32::from_le_bytes(buf[last_in_buf..last_in_buf + 4].try_into().unwrap()) as usize;
+            if last_len > MAX_FEATURE_BYTES {
+                return Err(Error::Format(format!("feature too large: {last_len}")));
+            }
+            let needed = last_in_buf + 4 + last_len;
+            if needed > buf.len() {
+                let more = read_range(r, stats, first + buf.len() as u64, needed - buf.len())?;
+                buf.extend_from_slice(&more);
+            }
+
+            for item in group {
+                let rel = (self.data_offset + item.offset as u64 - first) as usize;
+                if rel + 4 > buf.len() {
+                    return Err(Error::Format("coalesced read out of bounds".into()));
+                }
+                let len = u32::from_le_bytes(buf[rel..rel + 4].try_into().unwrap()) as usize;
+                if len > MAX_FEATURE_BYTES || rel + 4 + len > buf.len() {
+                    return Err(Error::Format("feature record out of bounds".into()));
+                }
+                let fbuf = buf[rel..rel + 4 + len].to_vec();
+                size_prefixed_root_as_feature(&fbuf)
+                    .map_err(|e| Error::Format(format!("invalid feature record: {e}")))?;
+                out.push((item.index as u64, fbuf));
+            }
+        }
+        Ok(out)
+    }
 }
+
+/// Maximum gap between consecutive hits sharing one coalesced range read.
+pub const COALESCE_GAP_BYTES: u64 = 64 * 1024;
+/// Indexes up to this size are fetched whole in one request.
+pub const SMALL_INDEX_BYTES: u64 = 256 * 1024;
+/// Minimum coalesced request size (avoids a 4-byte read + follow-up).
+pub const MIN_GROUP_READ_BYTES: u64 = 16 * 1024;
+/// Sanity cap on a single feature record.
+const MAX_FEATURE_BYTES: usize = 512 * 1024 * 1024;
 
 /// Parse a size-prefixed feature buffer (as returned by
 /// [`FgbSection::read_feature`]).

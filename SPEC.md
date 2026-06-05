@@ -95,9 +95,9 @@ u16 × total_vertices  payload
   `tol(z) = (2^32 >> z) / extent` in Q32 units (default extent 4096).
   The tolerance is quantized with the same function as the distances, so
   the comparison is consistent by construction.
-- The exact projection, quantization, and DP semantics are pinned by
-  fixture tests; they are the bit-compatibility contract for any other
-  producer/consumer of importance values.
+- The projection, quantization, and DP semantics above (including the
+  strict `>` tie-break and zero-deviation cutoff) are normative: any
+  producer must emit identical importance values for identical input.
 
 ## 5. Overview sections
 

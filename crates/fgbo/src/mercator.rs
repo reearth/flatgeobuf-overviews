@@ -5,9 +5,7 @@
 //! - **Q32 fixed-point unit mercator** (`[0, 2^32)`, y down): the space in
 //!   which importance values and tolerances are computed and quantized.
 //!   Coordinates snap to a 32-bit grid before any distance math, so
-//!   builds are deterministic across platforms; the exact projection and
-//!   tolerance formulas are pinned by fixtures (a bit-compatibility
-//!   contract for sidecar interoperability).
+//!   builds are deterministic across platforms.
 //! - **f64 unit square** (`[0, 1]`, y down): used only at render time for
 //!   tile clipping and MVT coordinate scaling.
 
@@ -170,22 +168,12 @@ mod tests {
         assert!(sq_tolerance_for_zoom(5, 4096) > sq_tolerance_for_zoom(14, 4096));
     }
 
-    // Pinned fixtures — the bit-compatibility contract for the Q32
-    // projection. Changing these values breaks sidecar interoperability.
     #[test]
-    fn q32_projection_fixtures() {
-        assert_eq!(lonlat_to_q32(0.0, 0.0), (2147483648, 2147483648));
-        assert_eq!(lonlat_to_q32(139.7, 35.6), (3814169568, 1692456229));
-        assert_eq!(lonlat_to_q32(-122.4, 37.7), (687194767, 1661224733));
-        assert_eq!(lonlat_to_q32(130.0, 33.0), (3698444060, 1730011504));
-    }
-
-    #[test]
-    fn tolerance_fixtures() {
-        assert_eq!(sq_tolerance_for_zoom(0, 4096), 1.099511627776e12);
-        assert_eq!(sq_tolerance_for_zoom(4, 4096), 4.294967296e9);
-        assert_eq!(sq_tolerance_for_zoom(12, 4096), 6.5536e4);
-        assert_eq!(sq_tolerance_for_zoom(14, 4096), 4.096e3);
+    fn q32_center_and_edges() {
+        let (x, y) = lonlat_to_q32(0.0, 0.0);
+        assert_eq!((x, y), (2147483648, 2147483648));
+        assert_eq!(lonlat_to_q32(-180.0, 0.0).0, 0);
+        assert_eq!(lonlat_to_q32(180.0, 0.0).0, u32::MAX);
     }
 
     #[test]

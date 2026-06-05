@@ -219,9 +219,9 @@ impl<R: Read + Seek> FgboReader<R> {
         let geometry_type = header.geometry_type();
         let columns = crate::fgb::column_names(&header);
 
-        let mut out = Vec::with_capacity(items.len());
-        for item in items {
-            let buf = section.read_feature(r, stats, item.offset as u64)?;
+        let records = section.read_features(r, stats, &items)?;
+        let mut out = Vec::with_capacity(records.len());
+        for (ordinal, buf) in records {
             let feature = feature_root(&buf)?;
             let geometry = feature_to_geo(&feature, geometry_type)?;
             let header = section.header();
@@ -236,7 +236,7 @@ impl<R: Read + Seek> FgboReader<R> {
                 })
                 .collect();
             out.push((
-                item.index as u64,
+                ordinal,
                 TileFeature {
                     geometry,
                     properties: props,

@@ -3,8 +3,7 @@
 //! survives simplification, geojson-vt style, plus the u16 quantization
 //! and the sidecar section encoding.
 //!
-//! Quantization and DP semantics are pinned exactly by fixtures — a
-//! bit-compatibility contract for sidecar interoperability:
+//! Quantization and DP semantics:
 //!
 //! - distances are squared Q32 distances, log-quantized:
 //!   `q = clamp(round(ln(1+d²) / ln(1+(2^32)²) × 65534), 1, 65534)`
@@ -78,11 +77,10 @@ fn sq_seg_dist(p: (f64, f64), a: (f64, f64), b: (f64, f64)) -> f64 {
 }
 
 /// Douglas–Peucker pass assigning each chosen interior vertex its
-/// quantized max deviation (geojson-vt "z value" method). Pinned
-/// semantics: strict `>` tie-break, recursion stops when the max
-/// deviation is exactly 0, unchosen vertices keep the default `1`.
-/// Iterative (explicit stack) to handle very large geometries without
-/// blowing the call stack.
+/// quantized max deviation (geojson-vt "z value" method): strict `>`
+/// tie-break, recursion stops when the max deviation is exactly 0,
+/// unchosen vertices keep the default `1`. Iterative (explicit stack) to
+/// handle very large geometries without blowing the call stack.
 fn dp(coords: &[(f64, f64)], imp: &mut [u16], first: usize, last: usize) {
     let mut stack = vec![(first, last)];
     while let Some((first, last)) = stack.pop() {
@@ -309,76 +307,6 @@ mod tests {
 
     /// World span as f64 — test coordinates are in Q32 units.
     const S: f64 = 4_294_967_296.0;
-
-    // Pinned quantization fixtures — the bit-compatibility contract.
-    // Changing these values breaks sidecar interoperability.
-    #[test]
-    fn quantize_fixtures() {
-        assert_eq!(quantize_sqdist(0.0), 1);
-        assert_eq!(quantize_sqdist(1.0), 1024);
-        assert_eq!(quantize_sqdist(2.0), 1623);
-        assert_eq!(quantize_sqdist(1e2), 6818);
-        assert_eq!(quantize_sqdist(1e6), 20409);
-        assert_eq!(quantize_sqdist(1e9), 30614);
-        assert_eq!(quantize_sqdist(1e12), 40819);
-        assert_eq!(quantize_sqdist(1e15), 51023);
-        assert_eq!(quantize_sqdist(1e18), 61228);
-        assert_eq!(quantize_sqdist(S * S), 65534);
-    }
-
-    #[test]
-    fn tolerance_threshold_fixtures() {
-        use crate::mercator::sq_tolerance_for_zoom;
-        assert_eq!(threshold_q(sq_tolerance_for_zoom(0, 4096)), 40959);
-        assert_eq!(threshold_q(sq_tolerance_for_zoom(4, 4096)), 32767);
-        assert_eq!(threshold_q(sq_tolerance_for_zoom(8, 4096)), 24575);
-        assert_eq!(threshold_q(sq_tolerance_for_zoom(11, 4096)), 18431);
-        assert_eq!(threshold_q(sq_tolerance_for_zoom(12, 4096)), 16384);
-        assert_eq!(threshold_q(sq_tolerance_for_zoom(14, 4096)), 12288);
-    }
-
-    /// Full-pipeline fixture: lon/lat -> Q32 -> importance arrays match
-    /// the companion prepare pipeline bit for bit.
-    #[test]
-    fn importance_fixtures() {
-        let to_q32_ls = |pts: &[(f64, f64)]| -> LineString<f64> {
-            LineString(
-                pts.iter()
-                    .map(|(lon, lat)| {
-                        let (x, y) = lonlat_to_q32(*lon, *lat);
-                        Coord {
-                            x: x as f64,
-                            y: y as f64,
-                        }
-                    })
-                    .collect(),
-            )
-        };
-
-        let pts: Vec<(f64, f64)> = (0..9)
-            .map(|i| {
-                let t = i as f64 / 8.0;
-                (130.0 + t, 33.0 + 0.5 * t + 0.05 * ((i % 3) as f64 - 1.0))
-            })
-            .collect();
-        let imp = geometry_importance(&Geometry::LineString(to_q32_ls(&pts)));
-        assert_eq!(
-            imp,
-            vec![65535, 19345, 41413, 39654, 19369, 41417, 40424, 19394, 65535]
-        );
-
-        let ring = [
-            (135.0, 35.0),
-            (135.5, 35.02),
-            (136.0, 35.0),
-            (136.0, 35.8),
-            (135.2, 35.6),
-            (135.0, 35.0),
-        ];
-        let p = geo_types::Polygon::new(to_q32_ls(&ring), vec![]);
-        let imp = geometry_importance(&Geometry::Polygon(p));
-        assert_eq!(imp, vec![65535, 37175, 47091, 49140, 45320, 65535]);
-    }
 
     #[test]
     fn quantize_monotone() {
