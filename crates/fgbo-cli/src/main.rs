@@ -156,9 +156,17 @@ fn main() -> Result<()> {
                 zbase,
                 drop_small_units: drop_small,
             };
+            let start = std::time::Instant::now();
             let report = encode_file(&input, &output, &opts)?;
+            let elapsed = start.elapsed().as_secs_f64();
             println!("FGBO written: {}", output.display());
             println!("  features        : {}", report.features_count);
+            println!(
+                "  build time      : {:.2} s ({} features/s, {}/s input)",
+                elapsed,
+                (report.features_count as f64 / elapsed) as u64,
+                human((report.body_size as f64 / elapsed) as u64),
+            );
             println!(
                 "  body            : {} (plain fgb, readable by any fgb reader)",
                 human(report.body_size)

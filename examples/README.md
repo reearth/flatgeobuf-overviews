@@ -81,3 +81,21 @@ How to read this honestly:
 
 The 200k variant shows the same shape (~10–12× at z10–11, parity at
 z12+), scaled down: baseline z10 tiles cost ~175 ms instead of ~880 ms.
+
+### Build cost
+
+`fgbo build` prints its own build time. Preprocessing the same 1M-building
+file into a servable artifact, on the same machine:
+
+| | time | output | artifact |
+|---|---|---|---|
+| plain fgb (no prep) | 0 s | 210 MiB | features; slow low-zoom tiles |
+| **`fgbo build`** | **1.7 s** (586k features/s) | 246 MiB (+17%) | features + fast tiles at every zoom |
+| `tippecanoe` → PMTiles (z0–14, `--drop-densest-as-needed`) | 69 s (~40× slower) | 86 MiB | baked tiles only |
+
+Honest reading: PMTiles wins on serving latency (pre-baked) and output
+size (tiles compress and drop density), at the cost of losing the
+feature-level artifact (no attribute joins, schema or style-driven
+changes without re-baking) and a ~40× longer build. FGBO's build is fast
+enough to sit inside upload/ETL paths where re-baking pipelines are too
+heavy — which is exactly the niche it aims at (see IDEA.md §7.3).
