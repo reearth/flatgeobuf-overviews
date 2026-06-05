@@ -3,3 +3,4 @@ node_modules/
 testdata/*.o.fgb
 *.mvt
 examples/compare/data/
+examples/bench/data/

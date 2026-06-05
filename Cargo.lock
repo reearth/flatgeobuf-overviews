@@ -388,6 +388,7 @@ dependencies = [
  "clap",
  "fgbo",
  "flatgeobuf",
+ "geo-types",
  "geozero",
  "tokio",
  "tracing",

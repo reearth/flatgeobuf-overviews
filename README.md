@@ -58,6 +58,17 @@ cargo run -rp fgbo-cli -- serve output.fgb
 # open http://127.0.0.1:8080/compare
 ```
 
+### Benchmark (synthetic buildings)
+
+```sh
+./examples/bench/run.sh     # 1M synthetic buildings, baseline vs FGBO
+```
+
+With 1M building footprints (+17% storage): **~10–12× faster tiles and
+~12× less I/O at z10–11** via overviews, parity at z12+ where bbox
+queries are already selective. Numbers and caveats in
+[examples/README.md](examples/README.md).
+
 Two synced MapLibre maps render the same file through the plain-fgb
 baseline path (left) and the FGBO path (right), with per-tile generation
 time, bytes read, and range-read counts. With NE 10m countries: ~2× less

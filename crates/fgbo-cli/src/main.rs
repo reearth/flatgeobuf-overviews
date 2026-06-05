@@ -1,6 +1,8 @@
 //! fgbo — CLI for FlatGeobuf Overviews.
 
+mod bench;
 mod serve;
+mod synth;
 
 use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand};
@@ -75,6 +77,37 @@ enum Command {
         /// Layer name for the output
         #[arg(long, default_value = "layer")]
         name: String,
+    },
+    /// Generate a synthetic building-footprint dataset (indexed fgb)
+    Synth {
+        #[arg(short, long)]
+        output: PathBuf,
+        /// Number of buildings
+        #[arg(long, default_value_t = 1_000_000)]
+        features: u64,
+        /// Number of city clusters
+        #[arg(long, default_value_t = 40)]
+        cities: u32,
+        /// RNG seed (deterministic output per seed)
+        #[arg(long, default_value_t = 42)]
+        seed: u64,
+        /// Region as west,south,east,north degrees
+        #[arg(long, default_value = "138.5,34.8,141.0,36.5")]
+        bbox: String,
+    },
+    /// Benchmark baseline (plain fgb) vs FGBO tile reads on the same file
+    Bench {
+        /// An FGBO file (output of `fgbo build`)
+        file: PathBuf,
+        /// Zoom levels to sample
+        #[arg(long, default_value = "8,10,12,14")]
+        zooms: String,
+        /// Tiles sampled per zoom
+        #[arg(long, default_value_t = 8)]
+        tiles: u32,
+        /// Sampling seed
+        #[arg(long, default_value_t = 1)]
+        seed: u64,
     },
 }
 
@@ -255,6 +288,52 @@ fn main() -> Result<()> {
         } => {
             convert(&input, &output, &name)?;
             println!("written: {}", output.display());
+        }
+
+        Command::Synth {
+            output,
+            features,
+            cities,
+            seed,
+            bbox,
+        } => {
+            let parts: Vec<f64> = bbox
+                .split(',')
+                .map(|s| s.trim().parse())
+                .collect::<std::result::Result<_, _>>()
+                .map_err(|e| anyhow::anyhow!("invalid --bbox: {e}"))?;
+            if parts.len() != 4 {
+                bail!("--bbox must be west,south,east,north");
+            }
+            let opts = synth::SynthOptions {
+                features,
+                cities,
+                seed,
+                bbox: (parts[0], parts[1], parts[2], parts[3]),
+            };
+            let n = synth::synth(&output, &opts)?;
+            println!("written: {} ({n} buildings)", output.display());
+        }
+
+        Command::Bench {
+            file,
+            zooms,
+            tiles,
+            seed,
+        } => {
+            let zooms: Vec<u8> = zooms
+                .split(',')
+                .map(|s| s.trim().parse())
+                .collect::<std::result::Result<_, _>>()
+                .map_err(|e| anyhow::anyhow!("invalid --zooms: {e}"))?;
+            bench::bench(
+                &file,
+                &bench::BenchOptions {
+                    zooms,
+                    tiles_per_zoom: tiles,
+                    seed,
+                },
+            )?;
         }
     }
     Ok(())

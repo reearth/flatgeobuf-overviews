@@ -176,8 +176,11 @@ impl<R: Read + Seek> FgboReader<R> {
         Ok(())
     }
 
-    /// Range-read the importance array of one feature ordinal.
+    /// Range-read the importance array of one feature ordinal. Loads the
+    /// offset table on first use (lazy: a tile whose features all skip
+    /// filtering never pays for the table).
     fn importance_for(&mut self, ordinal: u64) -> Result<Option<Vec<u16>>> {
+        self.ensure_sidecar_table()?;
         let Some(table) = &self.sidecar_table else {
             return Ok(None);
         };
@@ -306,9 +309,6 @@ impl<R: Read + Seek> FgboReader<R> {
             .as_ref()
             .map(|d| d.importance.is_some())
             .unwrap_or(false);
-        if has_sidecar {
-            self.ensure_sidecar_table()?;
-        }
 
         let mut features = Vec::with_capacity(body_features.len());
         let source = if has_sidecar {
@@ -317,28 +317,43 @@ impl<R: Read + Seek> FgboReader<R> {
             TileSource::BodyLive
         };
 
+        // Reading the importance array costs one range request per feature.
+        // For low-vertex geometries (e.g. building footprints) the filter
+        // cannot meaningfully reduce anything, so skip the read entirely —
+        // keeping extra vertices is always a valid (less aggressive)
+        // simplification.
+        const SKIP_FILTER_MAX_COORDS: usize = 32;
+
         for (ordinal, tf) in body_features {
+            let TileFeature {
+                geometry,
+                properties,
+            } = tf;
             let filtered = if has_sidecar {
-                match self.importance_for(ordinal)? {
-                    Some(imp) => filter_geometry(&tf.geometry, &imp, q),
-                    None => Some(tf.geometry.clone()),
+                if crate::simplify::coord_count(&geometry) <= SKIP_FILTER_MAX_COORDS {
+                    Some(geometry)
+                } else {
+                    match self.importance_for(ordinal)? {
+                        Some(imp) => filter_geometry(&geometry, &imp, q),
+                        None => Some(geometry),
+                    }
                 }
             } else {
                 // plain fgb: live DP (baseline path)
                 let merc = {
                     use geo::MapCoords;
-                    tf.geometry.map_coords(|c| {
+                    geometry.map_coords(|c| {
                         let (mx, my) = crate::mercator::project(c.x, c.y);
                         geo_types::Coord { x: mx, y: my }
                     })
                 };
                 let imp = geometry_importance(&merc);
-                filter_geometry(&tf.geometry, &imp, q)
+                filter_geometry(&geometry, &imp, q)
             };
             if let Some(geometry) = filtered {
                 features.push(TileFeature {
                     geometry,
-                    properties: tf.properties,
+                    properties,
                 });
             }
         }
@@ -379,6 +394,24 @@ impl<R: Read + Seek> FgboReader<R> {
         self.directory = saved;
         self.sidecar_table = saved_table;
         result
+    }
+
+    /// Count body features intersecting a lon/lat bbox using only the
+    /// index (no feature record reads). Useful for sampling/diagnostics.
+    pub fn body_hit_count(
+        &mut self,
+        min_x: f64,
+        min_y: f64,
+        max_x: f64,
+        max_y: f64,
+    ) -> Result<usize> {
+        if self.body.features_count == 0 || !self.body.has_index() {
+            return Ok(0);
+        }
+        Ok(self
+            .body
+            .search(&mut self.r, &self.stats, min_x, min_y, max_x, max_y)?
+            .len())
     }
 
     /// Geometry type of the body layer.
