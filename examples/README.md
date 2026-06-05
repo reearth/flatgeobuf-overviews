@@ -93,6 +93,24 @@ file into a servable artifact, on the same machine:
 | **`fgbo build`** | **1.7 s** (586k features/s) | 246 MiB (+17%) | features + fast tiles at every zoom |
 | `tippecanoe` → PMTiles (z0–14, `--drop-densest-as-needed`) | 69 s (~40× slower) | 86 MiB | baked tiles only |
 
+Build memory (peak RSS): the encoder streams the body (verbatim copy) and
+reads input features one at a time, so memory scales with the *extension
+sections being built* (importance sidecar + surviving overview features +
+fragments), not with file size:
+
+| input | peak RSS | ratio to input |
+|---|---|---|
+| 200k buildings (42 MiB) | 26 MiB | 0.6× |
+| 1M buildings (210 MiB) | 107 MiB | 0.5× |
+| 4M buildings (840 MiB) | 381 MiB | 0.45× |
+| NE 10m countries (8.5 MiB, vertex-dense) | 79 MiB | ~9× |
+
+Building-like data is thinned hard, so memory stays well under the input
+size and scales linearly (~95 MiB per 1M buildings). Vertex-dense data
+where overviews retain most vertices (already-generalized world polygons)
+is the worst case: the in-memory overview copies dominate. Streaming the
+overview build is the known TODO for very large vertex-dense inputs.
+
 Honest reading: PMTiles wins on serving latency (pre-baked) and output
 size (tiles compress and drop density), at the cost of losing the
 feature-level artifact (no attribute joins, schema or style-driven
