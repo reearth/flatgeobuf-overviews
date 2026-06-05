@@ -45,6 +45,17 @@ pub struct EncodeOptions {
     /// MVT-extent units (bbox, both dimensions) at a level's max zoom.
     /// 16 units == 1 screen pixel at extent 4096 / 256px tiles.
     pub drop_small_units: f64,
+    /// Which attribute columns to copy into overview sections:
+    /// `None` = all (default), `Some(names)` = only the listed columns
+    /// (empty = geometry only). Low-zoom styling typically uses few
+    /// attributes, so elision can shrink overview sections substantially.
+    /// The body and segments always keep full attributes.
+    ///
+    /// (An ID-reference mode — joining attributes from the body at read
+    /// time — is deliberately not offered: it would reintroduce
+    /// full-resolution random reads into the low-zoom path, defeating
+    /// the point of overview sections.)
+    pub overview_columns: Option<Vec<String>>,
 }
 
 impl Default for EncodeOptions {
@@ -68,6 +79,7 @@ impl Default for EncodeOptions {
             v_max: 16384,
             zbase: 12,
             drop_small_units: 16.0,
+            overview_columns: None,
         }
     }
 }
@@ -147,11 +159,60 @@ fn to_lonlat(geom: &Geometry<f64>) -> Geometry<f64> {
     })
 }
 
+/// Column subset of a section: which input columns it carries and how
+/// input column indexes remap to section column indexes.
+struct ColumnMap {
+    /// Section columns in input-column order: (name, type).
+    cols: Vec<(String, ColumnType)>,
+    /// Input column index -> section column index.
+    remap: Vec<Option<u16>>,
+}
+
+impl ColumnMap {
+    /// All input columns (identity mapping).
+    fn full(schema: &Schema) -> ColumnMap {
+        ColumnMap {
+            cols: schema.columns.clone(),
+            remap: (0..schema.columns.len() as u16).map(Some).collect(),
+        }
+    }
+
+    /// Only the named input columns (input order preserved). Unknown
+    /// names are rejected to catch typos at build time.
+    fn subset(schema: &Schema, names: &[String]) -> Result<ColumnMap> {
+        for n in names {
+            if !schema.columns.iter().any(|(c, _)| c == n) {
+                return Err(Error::InvalidInput(format!(
+                    "unknown overview column {n:?} (input has: {})",
+                    schema
+                        .columns
+                        .iter()
+                        .map(|(c, _)| c.as_str())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                )));
+            }
+        }
+        let mut cols = Vec::new();
+        let mut remap = Vec::with_capacity(schema.columns.len());
+        for (name, ty) in &schema.columns {
+            if names.contains(name) {
+                remap.push(Some(cols.len() as u16));
+                cols.push((name.clone(), *ty));
+            } else {
+                remap.push(None);
+            }
+        }
+        Ok(ColumnMap { cols, remap })
+    }
+}
+
 /// Create a section writer (overview level / segments). `FgbWriter`
 /// spools added features to a temp file, so feeding it during the input
 /// pass keeps encoder memory independent of section content size.
 fn new_section_writer<'a>(
     schema: &'a Schema,
+    columns: &ColumnMap,
     geometry_type: GeometryType,
 ) -> Result<FgbWriter<'a>> {
     let options = FgbWriterOptions {
@@ -164,31 +225,35 @@ fn new_section_writer<'a>(
             wkt: schema.crs_wkt.as_deref(),
             ..Default::default()
         },
-        has_z: false, // simplified outputs are 2D in v0
+        has_z: false, // FGBO extension sections are 2D by design
         ..Default::default()
     };
     let mut writer = FgbWriter::create_with_options(&schema.name, geometry_type, options)?;
-    for (name, ty) in &schema.columns {
+    for (name, ty) in &columns.cols {
         writer.add_column(name, *ty, |_, _| {});
     }
     Ok(writer)
 }
 
-/// Add one feature (geometry + property row) to a section writer.
+/// Add one feature (geometry + property row) to a section writer,
+/// remapping input column indexes to the section's column subset.
 fn add_section_feature(
     writer: &mut FgbWriter<'_>,
-    schema: &Schema,
+    columns: &ColumnMap,
     geom: Geometry<f64>,
     props: &[(u16, PropValue)],
 ) -> Result<()> {
     writer.add_feature_geom(geom, |feat| {
         for (idx, val) in props {
-            let name = schema
-                .columns
-                .get(*idx as usize)
+            let Some(Some(new_idx)) = columns.remap.get(*idx as usize) else {
+                continue;
+            };
+            let name = columns
+                .cols
+                .get(*new_idx as usize)
                 .map(|(n, _)| n.as_str())
                 .unwrap_or("");
-            let _ = feat.property(*idx as usize, name, &val.as_column_value());
+            let _ = feat.property(*new_idx as usize, name, &val.as_column_value());
         }
     })?;
     Ok(())
@@ -266,10 +331,17 @@ pub fn encode_file(input: &Path, output: &Path, opts: &EncodeOptions) -> Result<
         })
         .collect();
 
+    // overview sections may carry a column subset; body/segments keep all
+    let overview_columns = match &opts.overview_columns {
+        None => ColumnMap::full(&schema),
+        Some(names) => ColumnMap::subset(&schema, names)?,
+    };
+    let full_columns = ColumnMap::full(&schema);
+
     let mut level_writers: Vec<FgbWriter<'_>> = opts
         .levels
         .iter()
-        .map(|_| new_section_writer(&schema, schema.geometry_type))
+        .map(|_| new_section_writer(&schema, &overview_columns, schema.geometry_type))
         .collect::<Result<_>>()?;
     let mut level_counts: Vec<u64> = vec![0; opts.levels.len()];
     // fragments may change geometry type (clipping) => Unknown; created
@@ -306,7 +378,12 @@ pub fn encode_file(input: &Path, output: &Path, opts: &EncodeOptions) -> Result<
             for (li, q) in level_qs.iter().enumerate() {
                 if let Some(filtered) = filter_geometry(&geom, &imp, *q) {
                     if !is_too_small(&filtered, level_min_extents[li]) {
-                        add_section_feature(&mut level_writers[li], &schema, filtered, &props)?;
+                        add_section_feature(
+                            &mut level_writers[li],
+                            &overview_columns,
+                            filtered,
+                            &props,
+                        )?;
                         level_counts[li] += 1;
                     }
                 }
@@ -318,11 +395,15 @@ pub fn encode_file(input: &Path, output: &Path, opts: &EncodeOptions) -> Result<
                 let mut fragments: Vec<FeatureRecord> = Vec::new();
                 segment_feature(&merc, &props, opts.zbase, &mut fragments);
                 if segments_writer.is_none() {
-                    segments_writer = Some(new_section_writer(&schema, GeometryType::Unknown)?);
+                    segments_writer = Some(new_section_writer(
+                        &schema,
+                        &full_columns,
+                        GeometryType::Unknown,
+                    )?);
                 }
                 let writer = segments_writer.as_mut().unwrap();
                 for (frag, frag_props) in fragments {
-                    add_section_feature(writer, &schema, to_lonlat(&frag), &frag_props)?;
+                    add_section_feature(writer, &full_columns, to_lonlat(&frag), &frag_props)?;
                     fragment_count += 1;
                 }
                 segmented_ordinals.push(ordinal);

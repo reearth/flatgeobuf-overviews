@@ -42,6 +42,10 @@ enum Command {
         /// Feature thinning threshold in extent units (16 = 1 screen px)
         #[arg(long, default_value_t = 16.0)]
         drop_small: f64,
+        /// Attribute columns to copy into overview sections
+        /// (comma-separated; "none" = geometry only; default: all)
+        #[arg(long)]
+        overview_props: Option<String>,
     },
     /// Show fgb header and FGBO directory information
     /// (accepts a local path or an http(s) URL)
@@ -151,13 +155,22 @@ fn main() -> Result<()> {
             zbase,
             extent,
             drop_small,
+            overview_props,
         } => {
+            let overview_columns = overview_props.map(|s| {
+                if s.trim() == "none" || s.trim().is_empty() {
+                    Vec::new()
+                } else {
+                    s.split(',').map(|c| c.trim().to_string()).collect()
+                }
+            });
             let opts = EncodeOptions {
                 levels: parse_levels(&levels)?,
                 extent,
                 v_max: vmax,
                 zbase,
                 drop_small_units: drop_small,
+                overview_columns,
             };
             let start = std::time::Instant::now();
             let report = encode_file(&input, &output, &opts)?;

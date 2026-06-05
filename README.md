@@ -130,8 +130,12 @@ let tile = render_tile(&mut reader, 2, 3, 1, &TileOptions::default())?;
   - Only the JS full-scan path "yields all features, then errors"
     (the sentinel prevents misreads; upstream patch planned) ⚠️
 
-## Known v0 limitations / TODO
+## Scope and design decisions
 
-- Z/M values are treated as 2D (importance uses 2D distances)
-- Overview attributes are fully copied (attribute elision / ID-reference
-  modes not yet implemented)
+- **2D only**: Z/M values are not supported in the extension sections
+  (MVT output has no Z; the byte-preserved body retains original values)
+- **Overview attributes**: fully copied by default; select a subset with
+  `--overview-props name,height` (or `none` for geometry-only overviews)
+  when attributes dominate section size. An ID-reference/join mode is
+  deliberately not offered — it would put full-resolution random reads
+  back into the low-zoom path

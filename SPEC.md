@@ -25,6 +25,9 @@ Constraints:
 - Write-once. No appends or partial updates (rebuild instead).
 - Builds are deterministic: identical input and options produce
   byte-identical output.
+- Extension sections are 2D: Z/M values are not carried into importance,
+  overviews, or segments (out of scope by design — MVT output has no Z,
+  and the body, which is byte-preserved, retains the original values).
 
 ### 1.1 Sentinel
 
@@ -113,8 +116,13 @@ Same schema and CRS as the body, containing the feature set produced by:
    (default 16 units = 1 screen pixel at extent 4096).
 3. Drop degenerate results (collapsed rings etc.).
 
-Attributes are fully copied in v0 (attribute elision / ID-reference modes
-are future build options).
+Overview sections carry a build-time selectable subset of the input's
+attribute columns (default: all; selectable down to geometry only). The
+body and segments always keep full attributes. An ID-reference mode
+(joining attributes from the body at read time) is deliberately not
+specified: it would reintroduce full-resolution random reads into the
+low-zoom path, defeating the purpose of overview sections — if an
+attribute is needed at low zoom, copy it.
 
 A reader picks the level whose `[min_zoom, max_zoom]` contains z and
 performs a normal fgb read (index → range reads) within that section. The

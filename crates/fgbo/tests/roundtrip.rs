@@ -281,6 +281,59 @@ fn rejects_double_encode() {
 }
 
 #[test]
+fn overview_attribute_elision() {
+    let dir = tempfile::tempdir().unwrap();
+    let src = dir.path().join("src.fgb");
+    let out = dir.path().join("out.fgb");
+    write_test_fgb(&src, 100);
+
+    let opts = EncodeOptions {
+        overview_columns: Some(vec!["name".to_string()]),
+        ..Default::default()
+    };
+    encode_file(&src, &out, &opts).unwrap();
+
+    let mut reader = FgboReader::open_file(&out).unwrap();
+
+    // overview tile: only the selected column survives
+    let (x2, y2) = tile_at(2, 135.0, 35.0);
+    let q = reader.query_tile(2, x2, y2, 4096, 0.0).unwrap();
+    assert!(matches!(q.source, TileSource::Overview(0)));
+    assert!(!q.features.is_empty());
+    for f in &q.features {
+        let names: Vec<&str> = f.properties.iter().map(|(n, _)| n.as_str()).collect();
+        assert_eq!(names, ["name"], "overview must carry only selected columns");
+    }
+
+    // body path keeps full attributes
+    let (x13, y13) = tile_at(13, 135.0, 35.0);
+    let q = reader.query_tile(13, x13, y13, 4096, 0.0).unwrap();
+    if let Some(f) = q.features.first() {
+        let mut names: Vec<&str> = f.properties.iter().map(|(n, _)| n.as_str()).collect();
+        names.sort();
+        assert_eq!(names, ["name", "pop"], "body must keep all columns");
+    }
+
+    // unknown column names fail loudly
+    let bad = EncodeOptions {
+        overview_columns: Some(vec!["nope".to_string()]),
+        ..Default::default()
+    };
+    assert!(encode_file(&src, &dir.path().join("bad.fgb"), &bad).is_err());
+
+    // geometry-only overviews
+    let none = EncodeOptions {
+        overview_columns: Some(vec![]),
+        ..Default::default()
+    };
+    let out2 = dir.path().join("out2.fgb");
+    encode_file(&src, &out2, &none).unwrap();
+    let mut reader = FgboReader::open_file(&out2).unwrap();
+    let q = reader.query_tile(2, x2, y2, 4096, 0.0).unwrap();
+    assert!(q.features.iter().all(|f| f.properties.is_empty()));
+}
+
+#[test]
 fn plain_fgb_fallback() {
     let dir = tempfile::tempdir().unwrap();
     let src = dir.path().join("src.fgb");
