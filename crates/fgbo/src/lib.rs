@@ -17,6 +17,7 @@
 
 pub mod clip;
 pub mod decoder;
+#[cfg(feature = "writer")]
 pub mod encoder;
 pub mod error;
 pub mod fgb;
@@ -26,9 +27,11 @@ pub mod http;
 pub mod importance;
 pub mod mercator;
 pub mod simplify;
+pub mod sparse;
 pub mod tile;
 
 pub use decoder::{FgboReader, TileFeature, TileQuery, TileSource};
+#[cfg(feature = "writer")]
 pub use encoder::{encode_file, EncodeOptions, EncodeReport, LevelSpec};
 pub use error::{Error, Result};
 pub use format::{Directory, Footer};

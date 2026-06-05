@@ -28,8 +28,9 @@ vector analogue of what COG did for rasters and COPC did for point clouds.
 
 | crate | contents |
 |---|---|
-| [`crates/fgbo`](crates/fgbo) | library: encoder, decoder, MVT tile generation |
-| [`crates/fgbo-cli`](crates/fgbo-cli) | `fgbo` CLI: build / info / tile / serve / convert |
+| [`crates/fgbo`](crates/fgbo) | library: encoder, decoder, MVT tile generation (HTTP range reading behind the `http` feature; wasm-compatible core) |
+| [`crates/fgbo-cli`](crates/fgbo-cli) | `fgbo` CLI: build / info / tile / serve / convert / synth / bench — file paths or http(s) URLs |
+| [`crates/fgbo-wasm`](crates/fgbo-wasm) | browser reader: range-driven decoding + MVT rendering in wasm |
 
 ## Usage
 
@@ -49,6 +50,15 @@ cargo run -rp fgbo-cli -- tile output.fgb 2 3 1 --stats -o tile.mvt
 # Tile server + MapLibre debug page (http://127.0.0.1:8080/)
 # /compare shows fgb vs FGBO side by side with live I/O + timing stats
 cargo run -rp fgbo-cli -- serve output.fgb
+
+# Everything also works on remote files over HTTP range requests
+cargo run -rp fgbo-cli -- tile https://example.com/data.o.fgb 2 3 1 --stats
+```
+
+### Zero-server tiles in the browser (wasm)
+
+```sh
+./examples/wasm/run.sh      # browser demo: static hosting + range requests only
 ```
 
 ### Side-by-side comparison demo
@@ -125,8 +135,3 @@ let tile = render_tile(&mut reader, 2, 3, 1, &TileOptions::default())?;
 - Z/M values are treated as 2D (importance uses 2D distances)
 - Overview attributes are fully copied (attribute elision / ID-reference
   modes not yet implemented)
-- Remote reading (HTTP range reader) and wasm build not yet implemented
-  (`FgboReader` is built on a `Read + Seek` abstraction, so the extension
-  is straightforward)
-- No range-read coalescing yet — read `--stats` request counts as an upper
-  bound for an HTTP deployment

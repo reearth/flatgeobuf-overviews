@@ -4,3 +4,5 @@ testdata/*.o.fgb
 *.mvt
 examples/compare/data/
 examples/bench/data/
+examples/wasm/pkg/
+examples/wasm/data/

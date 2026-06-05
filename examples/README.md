@@ -1,5 +1,23 @@
 # Examples
 
+## wasm — tiles in the browser, no tile server at all
+
+The FGBO decoder + MVT tiler compiled to wasm (~250 KB), driving MapLibre
+through `addProtocol`. The "server" is any static host that supports HTTP
+range requests (R2/S3/GitHub Pages/nginx); the page fetches only the byte
+ranges each tile needs and renders MVT locally:
+
+```sh
+./examples/wasm/run.sh    # builds wasm, generates demo data, serves
+# open http://127.0.0.1:8090/
+```
+
+Reading is retry-driven (the browser cannot block on I/O): the wasm
+reader reports the first missing byte range, JS fetches it (padded to
+64 KiB), feeds it back, and retries — every round trip makes strict
+progress, and the chunk cache makes warm tiles free. The initial view
+over a 49 MiB / 200k-building file costs ~27 range requests / ~3 MiB.
+
 ## compare — fgb vs FGBO overview rendering, side by side
 
 A MapLibre page with two synced maps rendering tiles from **the same FGBO

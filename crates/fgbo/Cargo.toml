@@ -13,11 +13,13 @@ geo-types = { workspace = true }
 geo = { workspace = true }
 thiserror = { workspace = true }
 crc32fast = { workspace = true }
-tempfile = "3"
+tempfile = { version = "3", optional = true }
 ureq = { version = "3", optional = true }
 
 [features]
-default = []
+default = ["writer"]
+# encoder support (uses temp files; not available on wasm)
+writer = ["dep:tempfile"]
 http = ["dep:ureq"]
 
 [dev-dependencies]

@@ -1,0 +1,136 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>FGBO in the browser — zero-server tiles via range requests</title>
+<link rel="stylesheet" href="https://unpkg.com/maplibre-gl@4/dist/maplibre-gl.css">
+<script src="https://unpkg.com/maplibre-gl@4/dist/maplibre-gl.js"></script>
+<style>
+  html, body, #map { margin: 0; height: 100%; background: #0e1116; }
+  #hud {
+    position: absolute; top: 10px; left: 10px; z-index: 5;
+    background: rgba(14,17,22,.9); border: 1px solid #2a3140; border-radius: 8px;
+    color: #e6e9ef; padding: 10px 12px; font: 13px/1.5 ui-sans-serif, system-ui;
+    min-width: 240px;
+  }
+  #hud h1 { font-size: 13px; margin: 0 0 6px; }
+  #hud h1 b { color: #41c7a6; }
+  .stats { display: grid; grid-template-columns: auto 1fr; gap: 1px 10px; }
+  .stats dt { color: #8b94a3; }
+  .stats dd { margin: 0; text-align: right; font-variant-numeric: tabular-nums; }
+  #hud .sub { color: #8b94a3; font-size: 11px; margin-top: 6px; }
+</style>
+</head>
+<body>
+<div id="map"></div>
+<div id="hud">
+  <h1>FGBO <b>wasm</b> reader — tiles rendered in your browser</h1>
+  <dl class="stats">
+    <dt>file</dt><dd id="s-file">–</dd>
+    <dt>tiles rendered</dt><dd id="s-tiles">0</dd>
+    <dt>range requests</dt><dd id="s-fetches">0</dd>
+    <dt>bytes fetched</dt><dd id="s-bytes">0 B</dd>
+    <dt>cached</dt><dd id="s-cached">0 B</dd>
+  </dl>
+  <div class="sub">no tile server — the page range-reads the .fgb file
+  and renders MVT locally (decoder compiled to wasm)</div>
+</div>
+
+<script type="module">
+import init, { Fgbo } from "./pkg/fgbo_wasm.js";
+
+const FILE_URL = new URL("./data/demo.o.fgb", location.href).href;
+const FETCH_PAD = 64 * 1024; // over-fetch: pad every range to 64 KiB
+
+await init();
+
+const stats = { tiles: 0, fetches: 0, bytes: 0 };
+const human = n => n >= 1<<20 ? (n/(1<<20)).toFixed(1)+" MiB"
+              : n >= 1<<10 ? (n/(1<<10)).toFixed(1)+" KiB" : n+" B";
+
+// file length via range probe
+const probe = await fetch(FILE_URL, { headers: { Range: "bytes=0-0" } });
+if (probe.status !== 206) throw new Error("server must support range requests");
+const fileLen = Number(probe.headers.get("content-range").split("/")[1]);
+document.getElementById("s-file").textContent =
+  FILE_URL.split("/").pop() + " (" + human(fileLen) + ")";
+
+const fgbo = new Fgbo(fileLen);
+
+async function fetchRange(offset, len) {
+  const padded = Math.min(Math.max(len, FETCH_PAD), fileLen - offset);
+  const end = offset + padded - 1;
+  const res = await fetch(FILE_URL, { headers: { Range: `bytes=${offset}-${end}` } });
+  if (res.status !== 206) throw new Error("range request failed: " + res.status);
+  const buf = new Uint8Array(await res.arrayBuffer());
+  stats.fetches += 1;
+  stats.bytes += buf.length;
+  fgbo.feed(offset, buf);
+}
+
+// the wasm object is shared by all tile requests; serialize access
+let chain = Promise.resolve();
+function withLock(fn) {
+  const p = chain.then(fn);
+  chain = p.catch(() => {});
+  return p;
+}
+
+function renderHud() {
+  document.getElementById("s-tiles").textContent = stats.tiles;
+  document.getElementById("s-fetches").textContent = stats.fetches;
+  document.getElementById("s-bytes").textContent = human(stats.bytes);
+  document.getElementById("s-cached").textContent = human(fgbo.cached_bytes());
+}
+
+maplibregl.addProtocol("fgbo", (params, abort) =>
+  withLock(async () => {
+    // fgbo://tiles/{z}/{x}/{y}
+    const [z, x, y] = params.url.replace("fgbo://tiles/", "").split("/").map(Number);
+    let mvt;
+    while ((mvt = fgbo.tile(z, x, y)) === undefined) {
+      const need = fgbo.needed();
+      if (!need) throw new Error("tile failed without a missing range");
+      await fetchRange(need[0], need[1]);
+    }
+    stats.tiles += 1;
+    renderHud();
+    return { data: mvt.buffer };
+  })
+);
+
+// wait until the header is readable to get the layer name
+let layer;
+await withLock(async () => {
+  let name;
+  while ((name = fgbo.layer_name()) === undefined) {
+    const need = fgbo.needed();
+    await fetchRange(need[0], need[1]);
+  }
+  layer = name;
+});
+renderHud();
+
+const map = new maplibregl.Map({
+  container: "map",
+  style: {
+    version: 8,
+    sources: {
+      fgbo: { type: "vector", tiles: ["fgbo://tiles/{z}/{x}/{y}"], minzoom: 0, maxzoom: 22 },
+    },
+    layers: [
+      { id: "bg", type: "background", paint: { "background-color": "#10141a" } },
+      { id: "fill", type: "fill", source: "fgbo", "source-layer": layer,
+        filter: ["==", ["geometry-type"], "Polygon"],
+        paint: { "fill-color": "#41c7a6", "fill-opacity": 0.25 } },
+      { id: "line", type: "line", source: "fgbo", "source-layer": layer,
+        paint: { "line-color": "#41c7a6", "line-width": 1.0 } },
+    ],
+  },
+  center: [139.7, 35.6],
+  zoom: 9,
+});
+map.addControl(new maplibregl.NavigationControl());
+</script>
+</body>
+</html>

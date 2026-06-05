@@ -251,6 +251,7 @@ impl ImportanceSidecar {
     }
 }
 
+#[cfg(feature = "writer")]
 /// Streaming sidecar writer: the u16 payload goes to a temp file as
 /// features are processed; only the offset table (8 B per feature) stays
 /// in memory. Produces bytes identical to [`ImportanceSidecar::encode`].
@@ -260,6 +261,7 @@ pub struct SidecarStreamWriter {
     tmp: std::io::BufWriter<std::fs::File>,
 }
 
+#[cfg(feature = "writer")]
 impl SidecarStreamWriter {
     pub fn new() -> std::io::Result<Self> {
         Ok(SidecarStreamWriter {
